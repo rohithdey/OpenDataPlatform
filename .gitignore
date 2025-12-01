@@ -1,0 +1,44 @@
+# Environment files
+.env.local
+*.env.local
+
+# Data files
+data/
+*.duckdb
+*.duckdb.wal
+
+# Airflow logs
+airflow/logs/
+
+# Node modules
+ui/node_modules/
+ui/build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# DBT
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
