@@ -85,15 +85,18 @@ def check_ollama_available():
         return False
 
 def ensure_ollama_model(model_name="sqlcoder"):
-    """Ensure the model is pulled in Ollama"""
+    """Ensure the model is pulled in Ollama. Can be called for multiple models."""
     try:
         # Check if model exists
         response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         if response.status_code == 200:
             models = response.json().get("models", [])
+            # Extract base model names (before colon) for comparison
             model_names = [m.get("name", "").split(":")[0] for m in models]
 
-            if model_name not in model_names:
+            # Check if our model (base name) is in the list
+            base_model_name = model_name.split(":")[0]
+            if base_model_name not in model_names:
                 print(f"Pulling {model_name} model... This may take a few minutes on first run.")
                 # Pull the model
                 pull_response = requests.post(
@@ -102,6 +105,8 @@ def ensure_ollama_model(model_name="sqlcoder"):
                     timeout=300
                 )
                 return pull_response.status_code == 200
+            else:
+                print(f"Model {model_name} already available")
         return True
     except Exception as e:
         print(f"Error ensuring Ollama model: {e}")
@@ -427,7 +432,9 @@ async def ask_question(query: SemanticQuery):
         if check_ollama_available():
             try:
                 print("Using Ollama for text-to-SQL conversion...")
+                # Ensure both SQLCoder (for SQL) and Llama 3.2 (for answers) are available
                 ensure_ollama_model("sqlcoder")
+                ensure_ollama_model("llama3.2:3b")
 
                 sql_prompt = f"""### Task
 Generate a SQL query to answer the question based on the database schema below.
@@ -548,9 +555,30 @@ Rules:
             answer_text = f"Based on the query results, "
 
             # Try to generate a better answer with LLM
+            # Use Llama 3.2 for natural language answers (better than SQLCoder for this task)
             if check_ollama_available():
-                answer_prompt = f"Question: {query.question}\n\nSQL Query: {generated_sql}\n\nResults:\n{result_df.to_string()}\n\nProvide a clear, concise answer to the question:"
-                answer_text = query_ollama(answer_prompt, model="sqlcoder") or answer_text
+                try:
+                    # Use Llama 3.2 for conversational answers
+                    answer_prompt = f"""You are a helpful data assistant. Based on the question and query results below, provide a clear, concise answer in natural language.
+
+Question: {query.question}
+
+SQL Query: {generated_sql}
+
+Query Results:
+{result_df.to_string()}
+
+Provide a clear, natural language answer to the question based on these results:"""
+
+                    print("Using Llama 3.2 for natural language answer...")
+                    llama_answer = query_ollama(answer_prompt, model="llama3.2:3b")
+                    if llama_answer:
+                        answer_text = llama_answer
+                        print(f"Llama 3.2 answer: {answer_text}")
+                    else:
+                        print("Llama 3.2 failed, using default answer")
+                except Exception as e:
+                    print(f"Error using Llama 3.2 for answer: {e}")
             elif OPENAI_API_KEY:
                 import openai
                 client = openai.OpenAI(api_key=OPENAI_API_KEY)
