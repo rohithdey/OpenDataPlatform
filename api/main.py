@@ -429,31 +429,61 @@ async def ask_question(query: SemanticQuery):
                 print("Using Ollama for text-to-SQL conversion...")
                 ensure_ollama_model("sqlcoder")
 
-                sql_prompt = f"""{schema_context}
+                sql_prompt = f"""### Task
+Generate a SQL query to answer the question based on the database schema below.
 
-Question: {query.question}
+### Database Schema
+{schema_context}
 
-Generate a DuckDB SQL query to answer this question. Rules:
-- Return ONLY the SQL query, no explanations
-- Use proper DuckDB syntax
+### Question
+{query.question}
+
+### Instructions
+- Write a valid DuckDB SQL SELECT query
 - Include LIMIT 100 to prevent large result sets
-- Use JOINs if multiple tables are needed
-- Use GROUP BY for aggregations
-- SELECT queries only, no modifications
+- Return ONLY the SQL query with no explanations
+- Use proper DuckDB syntax
 
-SQL Query:"""
+### SQL Query
+SELECT"""
 
-                generated_sql = query_ollama(sql_prompt, model="sqlcoder")
+                generated_sql_raw = query_ollama(sql_prompt, model="sqlcoder")
 
-                if generated_sql:
-                    # Clean up the response
+                print(f"Raw Ollama response: {generated_sql_raw}")
+
+                if generated_sql_raw:
+                    # Clean up the response - SQLCoder often returns extra text
+                    generated_sql = generated_sql_raw.strip()
+
+                    # Remove markdown code blocks
                     if "```" in generated_sql:
-                        generated_sql = generated_sql.split("```")[1]
-                        if generated_sql.startswith("sql"):
-                            generated_sql = generated_sql[3:]
-                    generated_sql = generated_sql.strip().strip(";")
-                    llm_source = "Ollama (SQLCoder)"
-                    print(f"Generated SQL with Ollama: {generated_sql}")
+                        parts = generated_sql.split("```")
+                        for part in parts:
+                            if "SELECT" in part.upper() or "WITH" in part.upper():
+                                generated_sql = part
+                                break
+
+                    # Remove "sql" or "SQL" prefix if present
+                    if generated_sql.lower().startswith("sql"):
+                        generated_sql = generated_sql[3:].strip()
+
+                    # Add SELECT back if it was part of the prompt completion
+                    if not generated_sql.upper().startswith("SELECT") and not generated_sql.upper().startswith("WITH"):
+                        generated_sql = "SELECT " + generated_sql
+
+                    # Remove trailing semicolon and whitespace
+                    generated_sql = generated_sql.strip().rstrip(";").strip()
+
+                    # Validate it looks like SQL
+                    if generated_sql and (
+                        "SELECT" in generated_sql.upper() or
+                        "WITH" in generated_sql.upper()
+                    ):
+                        llm_source = "Ollama (SQLCoder)"
+                        print(f"Cleaned SQL from Ollama: {generated_sql}")
+                    else:
+                        print(f"Ollama response doesn't look like valid SQL, falling back")
+                        generated_sql = None
 
             except Exception as e:
                 print(f"Ollama error: {e}, falling back to OpenAI...")
