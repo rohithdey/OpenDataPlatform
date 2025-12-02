@@ -8,19 +8,19 @@
 #   export COMPOSE_FILE=docker-compose.yml:docker-compose.mac.yml
 #   docker-compose up -d
 
-version: '3.8'
-
 services:
-  # Disable the Docker-based Ollama service (we use native macOS Ollama instead)
+  # Scale down the Docker-based Ollama service (we use native macOS Ollama instead)
   ollama:
-    profiles:
-      - disabled  # This prevents the service from starting
+    deploy:
+      replicas: 0
 
   # Update API to use native Ollama on host
   api:
     environment:
-      # Use host.docker.internal to connect to native Ollama on macOS
+      - DUCKDB_PATH=/app/data/warehouse.duckdb
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-    depends_on:
-      - airflow-webserver
-      # Remove ollama dependency since we're using native
+      - AIRFLOW_API_URL=http://airflow-webserver:8080/api/v1
+      - AIRFLOW_USERNAME=admin
+      - AIRFLOW_PASSWORD=admin
+
