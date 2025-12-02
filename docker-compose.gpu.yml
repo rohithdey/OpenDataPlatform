@@ -1,0 +1,37 @@
+# Docker Compose override for GPU-enabled deployments
+# Use this for cloud deployments with NVIDIA GPUs (AWS, GCP, Azure)
+#
+# Prerequisites:
+#   1. NVIDIA GPU with CUDA support
+#   2. NVIDIA Docker runtime installed
+#   3. nvidia-docker2 package installed
+#
+# Installation:
+#   # Install NVIDIA Container Toolkit
+#   distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+#   curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+#   curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | \
+#     sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+#   sudo apt-get update && sudo apt-get install -y nvidia-docker2
+#   sudo systemctl restart docker
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Cloud Instance Recommendations:
+#   AWS: g4dn.xlarge (NVIDIA T4, ~$0.50/hour)
+#   GCP: n1-standard-4 + NVIDIA T4 (~$0.35/hour + $0.35/hour GPU)
+#   Azure: NC6s_v3 (NVIDIA V100, ~$3.06/hour)
+
+version: '3.8'
+
+services:
+  ollama:
+    # Enable GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1  # Use 1 GPU
+              capabilities: [gpu]
