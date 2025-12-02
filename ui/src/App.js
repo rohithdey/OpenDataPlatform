@@ -251,7 +251,7 @@ function SQLEditor() {
       <div className="editor-section">
         <div className="editor-header">
           <h3>SQL Query</h3>
-          <button onClick={executeQuery} disabled={loading} className="run-button">
+          <button onClick={() => executeQuery(0)} disabled={loading} className="run-button">
             <Play size={16} />
             {loading ? 'Running...' : 'Run Query'}
           </button>
@@ -263,7 +263,7 @@ function SQLEditor() {
           placeholder="Enter your SQL query..."
           onKeyDown={(e) => {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-              executeQuery();
+              executeQuery(0);
             }
           }}
         />
@@ -695,14 +695,15 @@ function AskData() {
           <div className="answer-section">
             <div className="answer-card" style={{
               padding: '20px',
-              backgroundColor: '#f8f9fa',
+              backgroundColor: 'rgba(59, 130, 246, 0.1)',
+              border: '1px solid rgba(59, 130, 246, 0.3)',
               borderRadius: '8px',
               marginBottom: '16px'
             }}>
               <div style={{ display: 'flex', alignItems: 'start', gap: '12px' }}>
-                <MessageSquare size={24} style={{ flexShrink: 0, marginTop: '2px' }} />
+                <MessageSquare size={24} style={{ flexShrink: 0, marginTop: '2px', color: '#3b82f6' }} />
                 <div style={{ flex: 1 }}>
-                  <h3 style={{ marginBottom: '8px' }}>Answer:</h3>
+                  <h3 style={{ marginBottom: '8px', color: '#3b82f6' }}>Answer:</h3>
                   <p style={{ fontSize: '16px', lineHeight: '1.6' }}>{answer.answer}</p>
                 </div>
               </div>
@@ -711,8 +712,8 @@ function AskData() {
             {answer.sql_query && (
               <div className="sql-query-card" style={{
                 padding: '16px',
-                backgroundColor: '#fff',
-                border: '1px solid #ddd',
+                backgroundColor: 'rgba(0, 0, 0, 0.2)',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
                 borderRadius: '8px',
                 marginBottom: '16px'
               }}>
@@ -721,12 +722,13 @@ function AskData() {
                   Generated SQL Query:
                 </h4>
                 <pre style={{
-                  backgroundColor: '#f5f5f5',
+                  backgroundColor: 'rgba(0, 0, 0, 0.3)',
                   padding: '12px',
                   borderRadius: '4px',
                   overflowX: 'auto',
                   fontSize: '14px',
-                  fontFamily: 'monospace'
+                  fontFamily: 'monospace',
+                  color: '#a0aec0'
                 }}>
                   {answer.sql_query}
                 </pre>
@@ -736,8 +738,8 @@ function AskData() {
             {answer.result_data && answer.result_data.length > 0 && (
               <div className="result-data-card" style={{
                 padding: '16px',
-                backgroundColor: '#fff',
-                border: '1px solid #ddd',
+                backgroundColor: 'rgba(0, 0, 0, 0.2)',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
                 borderRadius: '8px'
               }}>
                 <h4 style={{ marginBottom: '12px' }}>
@@ -769,8 +771,8 @@ function AskData() {
             {answer.error && (
               <div className="error-message" style={{
                 padding: '12px',
-                backgroundColor: '#fee',
-                border: '1px solid #fcc',
+                backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                border: '1px solid rgba(239, 68, 68, 0.3)',
                 borderRadius: '4px',
                 marginTop: '12px'
               }}>
