@@ -1,0 +1,26 @@
+# Docker Compose override for macOS with native Ollama
+# This configuration uses native Ollama for Metal GPU acceleration
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+#
+# Or set COMPOSE_FILE environment variable:
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.mac.yml
+#   docker-compose up -d
+
+version: '3.8'
+
+services:
+  # Disable the Docker-based Ollama service (we use native macOS Ollama instead)
+  ollama:
+    profiles:
+      - disabled  # This prevents the service from starting
+
+  # Update API to use native Ollama on host
+  api:
+    environment:
+      # Use host.docker.internal to connect to native Ollama on macOS
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    depends_on:
+      - airflow-webserver
+      # Remove ollama dependency since we're using native

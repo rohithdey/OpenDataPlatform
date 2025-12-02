@@ -1,5 +1,7 @@
 # 🚀 Deployment Guide - Local AI with Ollama
 
+> **🍎 macOS Users (M1/M2/M3/M4)**: For 5-10x faster performance with Metal GPU acceleration, use the **[macOS Setup Guide](SETUP-MAC.md)** instead. This guide is for Linux/Windows or if you prefer Docker on Mac.
+
 ## Overview
 
 Your OpenDataPlatform now includes **Ollama** with a **dual-model approach** for local AI-powered natural language queries:
