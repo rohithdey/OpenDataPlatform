@@ -217,18 +217,33 @@ function SQLEditor() {
   const [results, setResults] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [limit, setLimit] = useState(1000);
+  const [offset, setOffset] = useState(0);
 
-  const executeQuery = async () => {
+  const executeQuery = async (newOffset = 0) => {
     setLoading(true);
     setError(null);
     try {
-      const response = await api.post('/query', { query });
+      const response = await api.post('/query', {
+        query,
+        limit,
+        offset: newOffset
+      });
       setResults(response.data);
+      setOffset(newOffset);
     } catch (err) {
       setError(err.response?.data?.detail || 'Query execution failed');
       setResults(null);
     }
     setLoading(false);
+  };
+
+  const nextPage = () => {
+    executeQuery(offset + limit);
+  };
+
+  const prevPage = () => {
+    executeQuery(Math.max(0, offset - limit));
   };
 
   return (
@@ -262,37 +277,92 @@ function SQLEditor() {
             {error}
           </div>
         )}
-        
+
         {results && (
           <>
             <div className="results-header">
               <h3>Results</h3>
-              {results.row_count !== undefined && (
+              {results.total_rows !== undefined ? (
+                <span>
+                  Showing {offset + 1}-{offset + results.row_count} of {results.total_rows.toLocaleString()} total rows
+                </span>
+              ) : results.row_count !== undefined && (
                 <span>{results.row_count} rows returned</span>
               )}
             </div>
-            
+
+            {results.is_truncated && (
+              <div className="warning-message" style={{
+                padding: '12px',
+                backgroundColor: '#fff3cd',
+                border: '1px solid #ffc107',
+                borderRadius: '4px',
+                marginBottom: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px'
+              }}>
+                <AlertCircle size={16} />
+                <span>
+                  Results limited to {limit.toLocaleString()} rows for performance.
+                  {results.total_rows && ` Total: ${results.total_rows.toLocaleString()} rows.`}
+                  Use pagination controls below to view more data.
+                </span>
+              </div>
+            )}
+
             {results.data ? (
-              <div className="data-table-container">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      {results.columns.map(col => (
-                        <th key={col}>{col}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {results.data.map((row, i) => (
-                      <tr key={i}>
+              <>
+                <div className="data-table-container">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
                         {results.columns.map(col => (
-                          <td key={col}>{String(row[col] ?? '')}</td>
+                          <th key={col}>{col}</th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {results.data.map((row, i) => (
+                        <tr key={i}>
+                          {results.columns.map(col => (
+                            <td key={col}>{String(row[col] ?? '')}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {results.total_rows > limit && (
+                  <div className="pagination-controls" style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    padding: '12px',
+                    borderTop: '1px solid #ddd',
+                    marginTop: '12px'
+                  }}>
+                    <button
+                      onClick={prevPage}
+                      disabled={offset === 0}
+                      style={{ padding: '8px 16px' }}
+                    >
+                      Previous
+                    </button>
+                    <span>
+                      Page {Math.floor(offset / limit) + 1} of {Math.ceil(results.total_rows / limit)}
+                    </span>
+                    <button
+                      onClick={nextPage}
+                      disabled={offset + results.row_count >= results.total_rows}
+                      style={{ padding: '8px 16px' }}
+                    >
+                      Next
+                    </button>
+                  </div>
+                )}
+              </>
             ) : (
               <div className="success-message">
                 <CheckCircle size={16} />
@@ -519,16 +589,13 @@ function Jobs() {
   );
 }
 
-// Ask Data component (Semantic Search)
+// Ask Data component (Natural Language to SQL)
 function AskData() {
   const [question, setQuestion] = useState('');
   const [answer, setAnswer] = useState(null);
   const [loading, setLoading] = useState(false);
   const [tables, setTables] = useState([]);
-  const [vectorizedTables, setVectorizedTables] = useState([]);
   const [selectedTable, setSelectedTable] = useState('');
-  const [selectedColumns, setSelectedColumns] = useState([]);
-  const [tableColumns, setTableColumns] = useState([]);
 
   useEffect(() => {
     fetchTables();
@@ -543,140 +610,188 @@ function AskData() {
     }
   };
 
-  const fetchTableColumns = async (tableName) => {
-    try {
-      const response = await api.get(`/tables/${tableName}`);
-      setTableColumns(response.data.columns || []);
-    } catch (error) {
-      console.error('Error fetching columns:', error);
-    }
-  };
-
-  const vectorizeTable = async () => {
-    if (!selectedTable || selectedColumns.length === 0) return;
-    
-    setLoading(true);
-    try {
-      await api.post(`/vectorize/${selectedTable}`, selectedColumns);
-      setVectorizedTables([...vectorizedTables, selectedTable]);
-    } catch (error) {
-      console.error('Error vectorizing table:', error);
-    }
-    setLoading(false);
-  };
-
   const askQuestion = async () => {
     if (!question.trim()) return;
-    
+
     setLoading(true);
+    setAnswer(null);
     try {
-      const response = await api.post('/ask', { 
+      const response = await api.post('/ask', {
         question,
         table_name: selectedTable || null
       });
       setAnswer(response.data);
     } catch (error) {
       console.error('Error asking question:', error);
+      setAnswer({
+        answer: 'Error processing question. Please try again.',
+        error: error.response?.data?.detail || error.message
+      });
     }
     setLoading(false);
   };
 
   return (
     <div className="ask-data">
-      <div className="setup-section">
-        <h3>Setup Semantic Search</h3>
-        <p>First, select a table and columns to vectorize for natural language search.</p>
-        
-        <div className="vectorize-form">
-          <select
-            value={selectedTable}
-            onChange={(e) => {
-              setSelectedTable(e.target.value);
-              fetchTableColumns(e.target.value);
-            }}
-          >
-            <option value="">Select a table...</option>
-            {tables.map(table => (
-              <option key={table} value={table}>{table}</option>
-            ))}
-          </select>
-
-          {tableColumns.length > 0 && (
-            <div className="column-selector">
-              <p>Select text columns to vectorize:</p>
-              {tableColumns.map(col => (
-                <label key={col.name}>
-                  <input
-                    type="checkbox"
-                    checked={selectedColumns.includes(col.name)}
-                    onChange={(e) => {
-                      if (e.target.checked) {
-                        setSelectedColumns([...selectedColumns, col.name]);
-                      } else {
-                        setSelectedColumns(selectedColumns.filter(c => c !== col.name));
-                      }
-                    }}
-                  />
-                  {col.name} ({col.type})
-                </label>
-              ))}
-            </div>
-          )}
-
-          <button 
-            onClick={vectorizeTable} 
-            disabled={!selectedTable || selectedColumns.length === 0 || loading}
-          >
-            {loading ? 'Vectorizing...' : 'Vectorize Table'}
-          </button>
-        </div>
-
-        {vectorizedTables.length > 0 && (
-          <div className="vectorized-list">
-            <strong>Vectorized tables:</strong>
-            {vectorizedTables.map(t => (
-              <span key={t} className="vectorized-badge">{t}</span>
-            ))}
-          </div>
-        )}
+      <div className="ask-header" style={{ marginBottom: '24px' }}>
+        <h2>Ask Your Data</h2>
+        <p style={{ color: '#666', marginTop: '8px' }}>
+          Ask questions in plain English and get instant answers powered by AI and SQL.
+          No setup required - just type your question!
+        </p>
       </div>
 
       <div className="ask-section">
-        <h3>Ask a Question</h3>
-        <div className="question-input">
-          <input
-            type="text"
-            placeholder="e.g., What is the parent company of Microsoft?"
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && askQuestion()}
-          />
-          <button onClick={askQuestion} disabled={loading}>
-            <Search size={16} />
-            {loading ? 'Searching...' : 'Ask'}
-          </button>
+        <div className="question-form" style={{ marginBottom: '20px' }}>
+          <div style={{ marginBottom: '12px' }}>
+            <label style={{ display: 'block', marginBottom: '6px', fontWeight: '500' }}>
+              Optional: Limit to specific table
+            </label>
+            <select
+              value={selectedTable}
+              onChange={(e) => setSelectedTable(e.target.value)}
+              style={{ width: '100%', padding: '8px', borderRadius: '4px', border: '1px solid #ddd' }}
+            >
+              <option value="">All tables</option>
+              {tables.map(table => (
+                <option key={table} value={table}>{table}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="question-input" style={{ display: 'flex', gap: '8px' }}>
+            <input
+              type="text"
+              placeholder="e.g., What are the top 5 customers by revenue? How many orders were placed last month?"
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && !loading && askQuestion()}
+              style={{
+                flex: 1,
+                padding: '12px',
+                fontSize: '16px',
+                borderRadius: '4px',
+                border: '1px solid #ddd'
+              }}
+            />
+            <button
+              onClick={askQuestion}
+              disabled={loading || !question.trim()}
+              style={{
+                padding: '12px 24px',
+                fontSize: '16px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px'
+              }}
+            >
+              <Search size={16} />
+              {loading ? 'Thinking...' : 'Ask'}
+            </button>
+          </div>
         </div>
 
         {answer && (
           <div className="answer-section">
-            <div className="answer-text">
-              <MessageSquare size={20} />
-              <p>{answer.answer}</p>
+            <div className="answer-card" style={{
+              padding: '20px',
+              backgroundColor: '#f8f9fa',
+              borderRadius: '8px',
+              marginBottom: '16px'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'start', gap: '12px' }}>
+                <MessageSquare size={24} style={{ flexShrink: 0, marginTop: '2px' }} />
+                <div style={{ flex: 1 }}>
+                  <h3 style={{ marginBottom: '8px' }}>Answer:</h3>
+                  <p style={{ fontSize: '16px', lineHeight: '1.6' }}>{answer.answer}</p>
+                </div>
+              </div>
             </div>
-            
-            {answer.source_data && answer.source_data.length > 0 && (
-              <div className="source-data">
-                <h4>Source Data</h4>
-                {answer.source_data.map((item, i) => (
-                  <div key={i} className="source-item">
-                    <span className="similarity">
-                      {(item.similarity * 100).toFixed(1)}% match
-                    </span>
-                    <pre>{JSON.stringify(item.data, null, 2)}</pre>
-                  </div>
-                ))}
+
+            {answer.sql_query && (
+              <div className="sql-query-card" style={{
+                padding: '16px',
+                backgroundColor: '#fff',
+                border: '1px solid #ddd',
+                borderRadius: '8px',
+                marginBottom: '16px'
+              }}>
+                <h4 style={{ marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <FileText size={18} />
+                  Generated SQL Query:
+                </h4>
+                <pre style={{
+                  backgroundColor: '#f5f5f5',
+                  padding: '12px',
+                  borderRadius: '4px',
+                  overflowX: 'auto',
+                  fontSize: '14px',
+                  fontFamily: 'monospace'
+                }}>
+                  {answer.sql_query}
+                </pre>
               </div>
             )}
+
+            {answer.result_data && answer.result_data.length > 0 && (
+              <div className="result-data-card" style={{
+                padding: '16px',
+                backgroundColor: '#fff',
+                border: '1px solid #ddd',
+                borderRadius: '8px'
+              }}>
+                <h4 style={{ marginBottom: '12px' }}>
+                  Query Results {answer.row_count && `(${answer.row_count} rows)`}:
+                </h4>
+                <div style={{ overflowX: 'auto' }}>
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        {Object.keys(answer.result_data[0]).map(key => (
+                          <th key={key}>{key}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {answer.result_data.map((row, i) => (
+                        <tr key={i}>
+                          {Object.keys(row).map(key => (
+                            <td key={key}>{String(row[key] ?? '')}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {answer.error && (
+              <div className="error-message" style={{
+                padding: '12px',
+                backgroundColor: '#fee',
+                border: '1px solid #fcc',
+                borderRadius: '4px',
+                marginTop: '12px'
+              }}>
+                <AlertCircle size={16} />
+                <span>{answer.error}</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {!answer && !loading && (
+          <div style={{
+            padding: '40px',
+            textAlign: 'center',
+            color: '#666'
+          }}>
+            <MessageSquare size={48} style={{ opacity: 0.3, marginBottom: '16px' }} />
+            <p>Ask a question about your data to get started</p>
+            <p style={{ fontSize: '14px', marginTop: '8px' }}>
+              Example: "Show me the top 10 customers", "What's the average order value?"
+            </p>
           </div>
         )}
       </div>

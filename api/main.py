@@ -47,6 +47,8 @@ os.makedirs(os.path.dirname(DUCKDB_PATH), exist_ok=True)
 # Models
 class SQLQuery(BaseModel):
     query: str
+    limit: Optional[int] = 1000  # Default limit to prevent memory issues
+    offset: Optional[int] = 0     # For pagination
 
 class SemanticQuery(BaseModel):
     question: str
@@ -205,26 +207,57 @@ async def preview_table(table_name: str, limit: int = 100):
 
 @app.post("/query")
 async def execute_query(query_request: SQLQuery):
-    """Execute a SQL query against DuckDB"""
+    """Execute a SQL query against DuckDB with pagination and result limiting"""
     try:
         # Check if it's a SELECT query
         query = query_request.query.strip()
         is_select = query.upper().startswith("SELECT") or query.upper().startswith("WITH") or query.upper().startswith("SHOW") or query.upper().startswith("DESCRIBE")
-        
+
         # Use read_only for SELECT, write access for modifications
         conn = get_db_connection(read_only=is_select)
-        
+
         if is_select:
-            df = conn.execute(query).fetchdf()
+            # Get total count before applying limit (for pagination)
+            # Wrap query in a subquery to count total rows
+            count_query = f"SELECT COUNT(*) as total FROM ({query}) as subquery"
+            try:
+                total_rows = conn.execute(count_query).fetchone()[0]
+            except:
+                # If count query fails (e.g., for SHOW/DESCRIBE), fall back to basic execution
+                total_rows = None
+
+            # Apply limit and offset to the query
+            # Check if query already has LIMIT clause
+            query_upper = query.upper()
+            has_limit = 'LIMIT' in query_upper
+
+            if has_limit:
+                # User specified their own LIMIT, respect it but apply maximum
+                df = conn.execute(query).fetchdf()
+                applied_limit = len(df)
+                is_truncated = False
+            else:
+                # Apply our default limit with offset for pagination
+                limit = min(query_request.limit or 1000, 10000)  # Max 10k rows
+                offset = query_request.offset or 0
+                paginated_query = f"{query} LIMIT {limit} OFFSET {offset}"
+                df = conn.execute(paginated_query).fetchdf()
+                applied_limit = limit
+                is_truncated = total_rows is not None and (offset + len(df)) < total_rows
+
             result = {
                 "data": df.to_dict('records'),
                 "columns": list(df.columns),
-                "row_count": len(df)
+                "row_count": len(df),
+                "total_rows": total_rows,
+                "offset": query_request.offset or 0,
+                "limit": applied_limit,
+                "is_truncated": is_truncated
             }
         else:
             conn.execute(query)
             result = {"message": "Query executed successfully"}
-        
+
         conn.close()
         return result
     except Exception as e:
@@ -299,51 +332,108 @@ async def semantic_search(query: SemanticQuery):
 
 @app.post("/ask")
 async def ask_question(query: SemanticQuery):
-    """Ask a natural language question about the data"""
+    """Ask a natural language question about the data using text-to-SQL conversion"""
     try:
-        # First, get relevant data through semantic search
+        conn = get_db_connection()
+
+        # Get database schema context
         if query.table_name:
-            search_results = vector_store.semantic_search(query.question, query.table_name, top_k=10)
+            # Get schema for specific table
+            tables_to_query = [query.table_name]
         else:
-            search_results = []
-            for table_name in vector_store.embeddings.keys():
-                results = vector_store.semantic_search(query.question, table_name, top_k=5)
-                search_results.extend(results)
-        
-        if not search_results:
-            return {"answer": "No relevant data found. Please vectorize your tables first."}
-        
-        # Format context for LLM
-        context = "Based on the following data:\n\n"
-        for i, result in enumerate(search_results[:5]):
-            context += f"Record {i+1}: {json.dumps(result['data'], indent=2)}\n\n"
-        
-        # If OpenAI API key is available, use it for natural language response
+            # Get all tables
+            tables_result = conn.execute("SHOW TABLES").fetchall()
+            tables_to_query = [row[0] for row in tables_result]
+
+        # Build schema context
+        schema_context = "Database Schema:\n\n"
+        for table in tables_to_query:
+            columns = conn.execute(f"DESCRIBE {table}").fetchall()
+            schema_context += f"Table: {table}\n"
+            schema_context += "Columns:\n"
+            for col in columns:
+                schema_context += f"  - {col[0]} ({col[1]})\n"
+
+            # Add sample data for better context (first 3 rows)
+            sample = conn.execute(f"SELECT * FROM {table} LIMIT 3").fetchdf()
+            schema_context += f"Sample data (first 3 rows):\n{sample.to_string()}\n\n"
+
+        # If OpenAI API key is available, use it to generate SQL
         if OPENAI_API_KEY:
             try:
                 import openai
                 client = openai.OpenAI(api_key=OPENAI_API_KEY)
-                
+
+                system_prompt = """You are a SQL expert. Convert natural language questions into DuckDB SQL queries.
+Rules:
+1. Return ONLY the SQL query, no explanations
+2. Use proper DuckDB syntax
+3. Always include LIMIT 100 to prevent large result sets
+4. Use appropriate JOINs if multiple tables are needed
+5. For aggregations, use GROUP BY properly
+6. Return SELECT queries only, no modifications"""
+
                 response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="gpt-4",
                     messages=[
-                        {"role": "system", "content": "You are a helpful data assistant. Answer questions based on the provided data context. Be concise and accurate."},
-                        {"role": "user", "content": f"{context}\n\nQuestion: {query.question}"}
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"{schema_context}\n\nQuestion: {query.question}\n\nGenerate SQL query:"}
                     ],
-                    max_tokens=500
+                    max_tokens=500,
+                    temperature=0
                 )
-                
-                return {
-                    "answer": response.choices[0].message.content,
-                    "source_data": search_results[:5]
-                }
+
+                generated_sql = response.choices[0].message.content.strip()
+                # Remove markdown code blocks if present
+                if generated_sql.startswith("```"):
+                    generated_sql = generated_sql.split("```")[1]
+                    if generated_sql.startswith("sql"):
+                        generated_sql = generated_sql[3:]
+                generated_sql = generated_sql.strip()
+
+                # Execute the generated SQL
+                try:
+                    result_df = conn.execute(generated_sql).fetchdf()
+
+                    # Generate natural language answer
+                    answer_response = client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[
+                            {"role": "system", "content": "You are a helpful data assistant. Provide a concise, natural language answer based on the query results."},
+                            {"role": "user", "content": f"Question: {query.question}\n\nSQL Query: {generated_sql}\n\nResults:\n{result_df.to_string()}\n\nProvide a clear answer:"}
+                        ],
+                        max_tokens=300
+                    )
+
+                    conn.close()
+
+                    return {
+                        "answer": answer_response.choices[0].message.content,
+                        "sql_query": generated_sql,
+                        "result_data": result_df.to_dict('records')[:10],  # Limit displayed results
+                        "row_count": len(result_df)
+                    }
+                except Exception as sql_error:
+                    conn.close()
+                    return {
+                        "answer": f"I generated a SQL query but it failed to execute: {str(sql_error)}",
+                        "sql_query": generated_sql,
+                        "error": str(sql_error)
+                    }
+
             except Exception as e:
                 print(f"OpenAI error: {e}")
-        
-        # Fallback: return the most relevant data
+                conn.close()
+                return {
+                    "answer": f"Error using AI to answer question: {str(e)}. Please check your OPENAI_API_KEY.",
+                    "error": str(e)
+                }
+
+        # Fallback: use DuckDB's full-text search if available
+        conn.close()
         return {
-            "answer": f"Here are the most relevant records for your question:",
-            "source_data": search_results[:5]
+            "answer": "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable to use natural language queries.",
+            "available_tables": tables_to_query
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
