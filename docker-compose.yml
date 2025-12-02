@@ -111,6 +111,24 @@ services:
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
     user: "0:0"
 
+  # Ollama - Local LLM for text-to-SQL (cost-effective!)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
   # Backend API for the UI
   api:
     build:
@@ -125,11 +143,13 @@ services:
     environment:
       - DUCKDB_PATH=/app/data/warehouse.duckdb
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_BASE_URL=http://ollama:11434
       - AIRFLOW_API_URL=http://airflow-webserver:8080/api/v1
       - AIRFLOW_USERNAME=admin
       - AIRFLOW_PASSWORD=admin
     depends_on:
       - airflow-webserver
+      - ollama
     restart: always
 
   # Frontend UI
@@ -147,3 +167,4 @@ services:
 
 volumes:
   postgres-db-volume:
+  ollama-data:

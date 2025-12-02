@@ -711,7 +711,21 @@ function AskData() {
               <div style={{ display: 'flex', alignItems: 'start', gap: '12px' }}>
                 <MessageSquare size={24} style={{ flexShrink: 0, marginTop: '2px', color: '#3b82f6' }} />
                 <div style={{ flex: 1 }}>
-                  <h3 style={{ marginBottom: '8px', color: '#3b82f6' }}>Answer:</h3>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                    <h3 style={{ color: '#3b82f6', margin: 0 }}>Answer:</h3>
+                    {answer.llm_source && (
+                      <span style={{
+                        fontSize: '12px',
+                        padding: '4px 8px',
+                        backgroundColor: answer.llm_source.includes('Ollama') ? 'rgba(34, 197, 94, 0.2)' : 'rgba(168, 85, 247, 0.2)',
+                        border: `1px solid ${answer.llm_source.includes('Ollama') ? 'rgba(34, 197, 94, 0.4)' : 'rgba(168, 85, 247, 0.4)'}`,
+                        borderRadius: '4px',
+                        color: answer.llm_source.includes('Ollama') ? '#22c55e' : '#a855f7'
+                      }}>
+                        🚀 {answer.llm_source}
+                      </span>
+                    )}
+                  </div>
                   <p style={{ fontSize: '16px', lineHeight: '1.6' }}>{answer.answer}</p>
                 </div>
               </div>

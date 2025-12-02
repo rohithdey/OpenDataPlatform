@@ -40,6 +40,7 @@ AIRFLOW_API_URL = os.getenv("AIRFLOW_API_URL", "http://airflow-webserver:8080/ap
 AIRFLOW_USERNAME = os.getenv("AIRFLOW_USERNAME", "admin")
 AIRFLOW_PASSWORD = os.getenv("AIRFLOW_PASSWORD", "admin")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 
 # Ensure data directory exists
 os.makedirs(os.path.dirname(DUCKDB_PATH), exist_ok=True)
@@ -73,6 +74,67 @@ def get_db_connection(read_only=True):
     conn = duckdb.connect(DUCKDB_PATH, read_only=read_only)
     # Note: Iceberg extension removed - not needed and causes issues on ARM Macs
     return conn
+
+# Ollama helper functions
+def check_ollama_available():
+    """Check if Ollama service is available"""
+    try:
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def ensure_ollama_model(model_name="sqlcoder"):
+    """Ensure the model is pulled in Ollama"""
+    try:
+        # Check if model exists
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            model_names = [m.get("name", "").split(":")[0] for m in models]
+
+            if model_name not in model_names:
+                print(f"Pulling {model_name} model... This may take a few minutes on first run.")
+                # Pull the model
+                pull_response = requests.post(
+                    f"{OLLAMA_BASE_URL}/api/pull",
+                    json={"name": model_name},
+                    timeout=300
+                )
+                return pull_response.status_code == 200
+        return True
+    except Exception as e:
+        print(f"Error ensuring Ollama model: {e}")
+        return False
+
+def query_ollama(prompt, model="sqlcoder", system_prompt=None):
+    """Query Ollama LLM"""
+    try:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0,
+                "num_predict": 500
+            }
+        }
+
+        if system_prompt:
+            payload["system"] = system_prompt
+
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json=payload,
+            timeout=60
+        )
+
+        if response.status_code == 200:
+            return response.json().get("response", "").strip()
+        return None
+    except Exception as e:
+        print(f"Ollama query error: {e}")
+        return None
 
 # Vector store for semantic search
 class VectorStore:
@@ -332,7 +394,7 @@ async def semantic_search(query: SemanticQuery):
 
 @app.post("/ask")
 async def ask_question(query: SemanticQuery):
-    """Ask a natural language question about the data using text-to-SQL conversion"""
+    """Ask a natural language question about the data using text-to-SQL conversion (Ollama first, OpenAI fallback)"""
     try:
         conn = get_db_connection()
 
@@ -358,9 +420,49 @@ async def ask_question(query: SemanticQuery):
             sample = conn.execute(f"SELECT * FROM {table} LIMIT 3").fetchdf()
             schema_context += f"Sample data (first 3 rows):\n{sample.to_string()}\n\n"
 
-        # If OpenAI API key is available, use it to generate SQL
-        if OPENAI_API_KEY:
+        generated_sql = None
+        llm_source = None
+
+        # Try Ollama first (local, free, on-prem ready!)
+        if check_ollama_available():
             try:
+                print("Using Ollama for text-to-SQL conversion...")
+                ensure_ollama_model("sqlcoder")
+
+                sql_prompt = f"""{schema_context}
+
+Question: {query.question}
+
+Generate a DuckDB SQL query to answer this question. Rules:
+- Return ONLY the SQL query, no explanations
+- Use proper DuckDB syntax
+- Include LIMIT 100 to prevent large result sets
+- Use JOINs if multiple tables are needed
+- Use GROUP BY for aggregations
+- SELECT queries only, no modifications
+
+SQL Query:"""
+
+                generated_sql = query_ollama(sql_prompt, model="sqlcoder")
+
+                if generated_sql:
+                    # Clean up the response
+                    if "```" in generated_sql:
+                        generated_sql = generated_sql.split("```")[1]
+                        if generated_sql.startswith("sql"):
+                            generated_sql = generated_sql[3:]
+                    generated_sql = generated_sql.strip().strip(";")
+                    llm_source = "Ollama (SQLCoder)"
+                    print(f"Generated SQL with Ollama: {generated_sql}")
+
+            except Exception as e:
+                print(f"Ollama error: {e}, falling back to OpenAI...")
+                generated_sql = None
+
+        # Fallback to OpenAI if Ollama failed or unavailable
+        if not generated_sql and OPENAI_API_KEY:
+            try:
+                print("Using OpenAI for text-to-SQL conversion...")
                 import openai
                 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
@@ -390,51 +492,67 @@ Rules:
                     if generated_sql.startswith("sql"):
                         generated_sql = generated_sql[3:]
                 generated_sql = generated_sql.strip()
-
-                # Execute the generated SQL
-                try:
-                    result_df = conn.execute(generated_sql).fetchdf()
-
-                    # Generate natural language answer
-                    answer_response = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": "You are a helpful data assistant. Provide a concise, natural language answer based on the query results."},
-                            {"role": "user", "content": f"Question: {query.question}\n\nSQL Query: {generated_sql}\n\nResults:\n{result_df.to_string()}\n\nProvide a clear answer:"}
-                        ],
-                        max_tokens=300
-                    )
-
-                    conn.close()
-
-                    return {
-                        "answer": answer_response.choices[0].message.content,
-                        "sql_query": generated_sql,
-                        "result_data": result_df.to_dict('records')[:10],  # Limit displayed results
-                        "row_count": len(result_df)
-                    }
-                except Exception as sql_error:
-                    conn.close()
-                    return {
-                        "answer": f"I generated a SQL query but it failed to execute: {str(sql_error)}",
-                        "sql_query": generated_sql,
-                        "error": str(sql_error)
-                    }
+                llm_source = "OpenAI (GPT-4)"
 
             except Exception as e:
                 print(f"OpenAI error: {e}")
                 conn.close()
                 return {
-                    "answer": f"Error using AI to answer question: {str(e)}. Please check your OPENAI_API_KEY.",
+                    "answer": f"Both Ollama and OpenAI failed. Error: {str(e)}",
                     "error": str(e)
                 }
 
-        # Fallback: use DuckDB's full-text search if available
-        conn.close()
-        return {
-            "answer": "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable to use natural language queries.",
-            "available_tables": tables_to_query
-        }
+        # If no LLM available
+        if not generated_sql:
+            conn.close()
+            return {
+                "answer": "No AI service available. Please configure either Ollama (local, free) or OpenAI API key.",
+                "available_tables": tables_to_query
+            }
+
+        # Execute the generated SQL
+        try:
+            result_df = conn.execute(generated_sql).fetchdf()
+
+            # Generate natural language answer
+            answer_text = f"Based on the query results, "
+
+            # Try to generate a better answer with LLM
+            if check_ollama_available():
+                answer_prompt = f"Question: {query.question}\n\nSQL Query: {generated_sql}\n\nResults:\n{result_df.to_string()}\n\nProvide a clear, concise answer to the question:"
+                answer_text = query_ollama(answer_prompt, model="sqlcoder") or answer_text
+            elif OPENAI_API_KEY:
+                import openai
+                client = openai.OpenAI(api_key=OPENAI_API_KEY)
+                answer_response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful data assistant. Provide a concise, natural language answer based on the query results."},
+                        {"role": "user", "content": f"Question: {query.question}\n\nSQL Query: {generated_sql}\n\nResults:\n{result_df.to_string()}\n\nProvide a clear answer:"}
+                    ],
+                    max_tokens=300
+                )
+                answer_text = answer_response.choices[0].message.content
+
+            conn.close()
+
+            return {
+                "answer": answer_text,
+                "sql_query": generated_sql,
+                "result_data": result_df.to_dict('records')[:10],  # Limit displayed results
+                "row_count": len(result_df),
+                "llm_source": llm_source
+            }
+
+        except Exception as sql_error:
+            conn.close()
+            return {
+                "answer": f"I generated a SQL query but it failed to execute: {str(sql_error)}",
+                "sql_query": generated_sql,
+                "error": str(sql_error),
+                "llm_source": llm_source
+            }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
