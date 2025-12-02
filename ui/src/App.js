@@ -294,13 +294,14 @@ function SQLEditor() {
             {results.is_truncated && (
               <div className="warning-message" style={{
                 padding: '12px',
-                backgroundColor: '#fff3cd',
-                border: '1px solid #ffc107',
+                backgroundColor: 'rgba(251, 191, 36, 0.15)',
+                border: '1px solid rgba(251, 191, 36, 0.4)',
                 borderRadius: '4px',
                 marginBottom: '12px',
                 display: 'flex',
                 alignItems: 'center',
-                gap: '8px'
+                gap: '8px',
+                color: '#fbbf24'
               }}>
                 <AlertCircle size={16} />
                 <span>
@@ -340,23 +341,30 @@ function SQLEditor() {
                     justifyContent: 'space-between',
                     alignItems: 'center',
                     padding: '12px',
-                    borderTop: '1px solid #ddd',
-                    marginTop: '12px'
+                    borderTop: '1px solid rgba(255, 255, 255, 0.1)',
+                    marginTop: '12px',
+                    backgroundColor: 'rgba(0, 0, 0, 0.2)'
                   }}>
                     <button
                       onClick={prevPage}
                       disabled={offset === 0}
-                      style={{ padding: '8px 16px' }}
+                      style={{
+                        padding: '8px 16px',
+                        opacity: offset === 0 ? 0.5 : 1
+                      }}
                     >
                       Previous
                     </button>
-                    <span>
+                    <span style={{ fontSize: '14px' }}>
                       Page {Math.floor(offset / limit) + 1} of {Math.ceil(results.total_rows / limit)}
                     </span>
                     <button
                       onClick={nextPage}
                       disabled={offset + results.row_count >= results.total_rows}
-                      style={{ padding: '8px 16px' }}
+                      style={{
+                        padding: '8px 16px',
+                        opacity: (offset + results.row_count >= results.total_rows) ? 0.5 : 1
+                      }}
                     >
                       Next
                     </button>
@@ -635,7 +643,7 @@ function AskData() {
     <div className="ask-data">
       <div className="ask-header" style={{ marginBottom: '24px' }}>
         <h2>Ask Your Data</h2>
-        <p style={{ color: '#666', marginTop: '8px' }}>
+        <p style={{ color: '#a0aec0', marginTop: '8px' }}>
           Ask questions in plain English and get instant answers powered by AI and SQL.
           No setup required - just type your question!
         </p>
@@ -787,11 +795,11 @@ function AskData() {
           <div style={{
             padding: '40px',
             textAlign: 'center',
-            color: '#666'
+            color: '#a0aec0'
           }}>
             <MessageSquare size={48} style={{ opacity: 0.3, marginBottom: '16px' }} />
             <p>Ask a question about your data to get started</p>
-            <p style={{ fontSize: '14px', marginTop: '8px' }}>
+            <p style={{ fontSize: '14px', marginTop: '8px', color: '#718096' }}>
               Example: "Show me the top 10 customers", "What's the average order value?"
             </p>
           </div>
