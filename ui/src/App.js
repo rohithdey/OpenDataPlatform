@@ -30,6 +30,8 @@ function TabNav({ activeTab, setActiveTab }) {
   const tabs = [
     { id: 'data', label: 'Data Explorer', icon: Database },
     { id: 'sql', label: 'SQL Editor', icon: FileText },
+    { id: 'pipelines', label: 'Create Pipeline', icon: Plus },
+    { id: 'transforms', label: 'Transforms', icon: BarChart3 },
     { id: 'jobs', label: 'Jobs', icon: Play },
     { id: 'ask', label: 'Ask Data', icon: MessageSquare },
   ];
@@ -823,6 +825,509 @@ function AskData() {
   );
 }
 
+// Pipeline Creator component
+function PipelineCreator() {
+  const [sourceType, setSourceType] = useState('yahoo_finance');
+  const [symbols, setSymbols] = useState('AAPL,TSLA,MSFT');
+  const [period, setPeriod] = useState('1y');
+  const [dagId, setDagId] = useState('yahoo_finance_daily');
+  const [tableName, setTableName] = useState('stock_prices');
+  const [schedule, setSchedule] = useState('0 16 * * 1-5');
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState(null);
+  const [fetchLoading, setFetchLoading] = useState(false);
+
+  const createDAG = async () => {
+    setLoading(true);
+    setMessage(null);
+    try {
+      const symbolList = symbols.split(',').map(s => s.trim()).filter(s => s);
+
+      const response = await api.post('/dags/yahoo-finance/create', {
+        dag_id: dagId,
+        description: `Yahoo Finance data ingestion for ${symbolList.join(', ')}`,
+        symbols: symbolList,
+        period: period,
+        interval: '1d',
+        schedule: schedule,
+        target_table: tableName
+      });
+
+      setMessage({ type: 'success', text: response.data.message });
+    } catch (error) {
+      setMessage({ type: 'error', text: error.response?.data?.detail || error.message });
+    }
+    setLoading(false);
+  };
+
+  const fetchNow = async () => {
+    setFetchLoading(true);
+    setMessage(null);
+    try {
+      const symbolList = symbols.split(',').map(s => s.trim()).filter(s => s);
+
+      const response = await api.post('/dags/yahoo-finance/fetch-now', {
+        symbols: symbolList,
+        period: period,
+        table_name: tableName
+      });
+
+      setMessage({
+        type: 'success',
+        text: `✓ Fetched ${response.data.rows_loaded} rows for ${symbolList.join(', ')}`
+      });
+    } catch (error) {
+      setMessage({ type: 'error', text: error.response?.data?.detail || error.message });
+    }
+    setFetchLoading(false);
+  };
+
+  return (
+    <div className="pipeline-creator" style={{ padding: '24px', maxWidth: '800px', margin: '0 auto' }}>
+      <h2 style={{ marginBottom: '24px', color: '#f7fafc' }}>Create Data Pipeline</h2>
+
+      <div style={{ marginBottom: '24px', padding: '16px', backgroundColor: 'rgba(66, 153, 225, 0.1)', borderRadius: '8px', border: '1px solid rgba(66, 153, 225, 0.2)' }}>
+        <p style={{ margin: 0, fontSize: '14px', color: '#90cdf4' }}>
+          💡 This creates an Airflow DAG that automatically fetches stock data on schedule
+        </p>
+      </div>
+
+      <div style={{ backgroundColor: 'rgba(255, 255, 255, 0.05)', padding: '24px', borderRadius: '8px', marginBottom: '24px' }}>
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            Data Source
+          </label>
+          <select
+            value={sourceType}
+            onChange={(e) => setSourceType(e.target.value)}
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0'
+            }}
+          >
+            <option value="yahoo_finance">Yahoo Finance (Stock Prices)</option>
+          </select>
+        </div>
+
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            Stock Symbols (comma-separated)
+          </label>
+          <input
+            type="text"
+            value={symbols}
+            onChange={(e) => setSymbols(e.target.value)}
+            placeholder="AAPL,TSLA,MSFT,GOOGL"
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0'
+            }}
+          />
+        </div>
+
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            Historical Period
+          </label>
+          <select
+            value={period}
+            onChange={(e) => setPeriod(e.target.value)}
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0'
+            }}
+          >
+            <option value="1mo">1 Month</option>
+            <option value="3mo">3 Months</option>
+            <option value="6mo">6 Months</option>
+            <option value="1y">1 Year</option>
+            <option value="2y">2 Years</option>
+            <option value="5y">5 Years</option>
+          </select>
+        </div>
+
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            DAG ID
+          </label>
+          <input
+            type="text"
+            value={dagId}
+            onChange={(e) => setDagId(e.target.value)}
+            placeholder="my_stock_pipeline"
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0'
+            }}
+          />
+        </div>
+
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            Target Table Name
+          </label>
+          <input
+            type="text"
+            value={tableName}
+            onChange={(e) => setTableName(e.target.value)}
+            placeholder="stock_prices"
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0'
+            }}
+          />
+        </div>
+
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            Schedule (Cron)
+          </label>
+          <input
+            type="text"
+            value={schedule}
+            onChange={(e) => setSchedule(e.target.value)}
+            placeholder="0 16 * * 1-5"
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0',
+              fontFamily: 'monospace'
+            }}
+          />
+          <p style={{ marginTop: '4px', fontSize: '12px', color: '#a0aec0' }}>
+            Example: "0 16 * * 1-5" = 4 PM weekdays (after market close)
+          </p>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: '12px' }}>
+        <button
+          onClick={fetchNow}
+          disabled={fetchLoading}
+          style={{
+            flex: 1,
+            padding: '12px 24px',
+            backgroundColor: fetchLoading ? '#4a5568' : 'rgba(72, 187, 120, 0.2)',
+            color: '#68d391',
+            border: '1px solid rgba(72, 187, 120, 0.3)',
+            borderRadius: '4px',
+            cursor: fetchLoading ? 'not-allowed' : 'pointer',
+            fontWeight: '500'
+          }}
+        >
+          {fetchLoading ? 'Fetching...' : '⚡ Fetch Data Now (Test)'}
+        </button>
+
+        <button
+          onClick={createDAG}
+          disabled={loading}
+          style={{
+            flex: 1,
+            padding: '12px 24px',
+            backgroundColor: loading ? '#4a5568' : 'rgba(66, 153, 225, 0.2)',
+            color: '#90cdf4',
+            border: '1px solid rgba(66, 153, 225, 0.3)',
+            borderRadius: '4px',
+            cursor: loading ? 'not-allowed' : 'pointer',
+            fontWeight: '500'
+          }}
+        >
+          {loading ? 'Creating...' : '📅 Create Scheduled DAG'}
+        </button>
+      </div>
+
+      {message && (
+        <div style={{
+          marginTop: '20px',
+          padding: '12px',
+          backgroundColor: message.type === 'success' ? 'rgba(72, 187, 120, 0.1)' : 'rgba(245, 101, 101, 0.1)',
+          border: `1px solid ${message.type === 'success' ? 'rgba(72, 187, 120, 0.3)' : 'rgba(245, 101, 101, 0.3)'}`,
+          borderRadius: '4px',
+          color: message.type === 'success' ? '#68d391' : '#fc8181'
+        }}>
+          {message.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Transforms component
+function Transforms() {
+  const [templates, setTemplates] = useState([]);
+  const [selectedTemplate, setSelectedTemplate] = useState(null);
+  const [modelName, setModelName] = useState('');
+  const [sourceTable, setSourceTable] = useState('stock_prices');
+  const [dateColumn, setDateColumn] = useState('date');
+  const [valueColumn, setValueColumn] = useState('close');
+  const [groupByColumn, setGroupByColumn] = useState('symbol');
+  const [windows, setWindows] = useState('7,30,90');
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState(null);
+
+  useEffect(() => {
+    fetchTemplates();
+  }, []);
+
+  const fetchTemplates = async () => {
+    try {
+      const response = await api.get('/dbt/templates');
+      setTemplates(response.data.templates || []);
+    } catch (error) {
+      console.error('Error fetching templates:', error);
+    }
+  };
+
+  const createTransform = async () => {
+    if (!selectedTemplate || !modelName) {
+      setMessage({ type: 'error', text: 'Please select a template and enter a model name' });
+      return;
+    }
+
+    setLoading(true);
+    setMessage(null);
+
+    try {
+      const parameters = {
+        date_column: dateColumn,
+        value_column: valueColumn,
+        group_by_column: groupByColumn
+      };
+
+      if (selectedTemplate === 'moving_averages') {
+        parameters.windows = windows.split(',').map(w => parseInt(w.trim()));
+      }
+
+      const response = await api.post('/dbt/create-from-template', {
+        template_id: selectedTemplate,
+        model_name: modelName,
+        source_table: sourceTable,
+        parameters: parameters
+      });
+
+      setMessage({ type: 'success', text: response.data.message });
+      setModelName('');
+    } catch (error) {
+      setMessage({ type: 'error', text: error.response?.data?.detail || error.message });
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="transforms" style={{ padding: '24px', maxWidth: '800px', margin: '0 auto' }}>
+      <h2 style={{ marginBottom: '24px', color: '#f7fafc' }}>Create Data Transformation</h2>
+
+      <div style={{ marginBottom: '24px', padding: '16px', backgroundColor: 'rgba(159, 122, 234, 0.1)', borderRadius: '8px', border: '1px solid rgba(159, 122, 234, 0.2)' }}>
+        <p style={{ margin: 0, fontSize: '14px', color: '#c4b5fd' }}>
+          🔄 Transforms use DBT to calculate metrics like daily returns, moving averages, and volatility
+        </p>
+      </div>
+
+      <div style={{ backgroundColor: 'rgba(255, 255, 255, 0.05)', padding: '24px', borderRadius: '8px', marginBottom: '24px' }}>
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            Transformation Template
+          </label>
+          <select
+            value={selectedTemplate || ''}
+            onChange={(e) => {
+              setSelectedTemplate(e.target.value);
+              setModelName(e.target.value ? `${e.target.value}_model` : '');
+            }}
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0'
+            }}
+          >
+            <option value="">Select a template...</option>
+            {templates.map(template => (
+              <option key={template.id} value={template.id}>
+                {template.name} - {template.description}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            Model Name
+          </label>
+          <input
+            type="text"
+            value={modelName}
+            onChange={(e) => setModelName(e.target.value)}
+            placeholder="my_transformation"
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0'
+            }}
+          />
+        </div>
+
+        <div style={{ marginBottom: '20px' }}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+            Source Table
+          </label>
+          <input
+            type="text"
+            value={sourceTable}
+            onChange={(e) => setSourceTable(e.target.value)}
+            placeholder="stock_prices"
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: '#2d3748',
+              border: '1px solid #4a5568',
+              borderRadius: '4px',
+              color: '#e2e8f0'
+            }}
+          />
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px', marginBottom: '20px' }}>
+          <div>
+            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0', fontSize: '14px' }}>
+              Date Column
+            </label>
+            <input
+              type="text"
+              value={dateColumn}
+              onChange={(e) => setDateColumn(e.target.value)}
+              style={{
+                width: '100%',
+                padding: '8px',
+                backgroundColor: '#2d3748',
+                border: '1px solid #4a5568',
+                borderRadius: '4px',
+                color: '#e2e8f0'
+              }}
+            />
+          </div>
+          <div>
+            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0', fontSize: '14px' }}>
+              Value Column
+            </label>
+            <input
+              type="text"
+              value={valueColumn}
+              onChange={(e) => setValueColumn(e.target.value)}
+              style={{
+                width: '100%',
+                padding: '8px',
+                backgroundColor: '#2d3748',
+                border: '1px solid #4a5568',
+                borderRadius: '4px',
+                color: '#e2e8f0'
+              }}
+            />
+          </div>
+          <div>
+            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0', fontSize: '14px' }}>
+              Group By Column
+            </label>
+            <input
+              type="text"
+              value={groupByColumn}
+              onChange={(e) => setGroupByColumn(e.target.value)}
+              style={{
+                width: '100%',
+                padding: '8px',
+                backgroundColor: '#2d3748',
+                border: '1px solid #4a5568',
+                borderRadius: '4px',
+                color: '#e2e8f0'
+              }}
+            />
+          </div>
+        </div>
+
+        {selectedTemplate === 'moving_averages' && (
+          <div style={{ marginBottom: '20px' }}>
+            <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
+              Moving Average Windows (comma-separated days)
+            </label>
+            <input
+              type="text"
+              value={windows}
+              onChange={(e) => setWindows(e.target.value)}
+              placeholder="7,30,90"
+              style={{
+                width: '100%',
+                padding: '10px',
+                backgroundColor: '#2d3748',
+                border: '1px solid #4a5568',
+                borderRadius: '4px',
+                color: '#e2e8f0'
+              }}
+            />
+          </div>
+        )}
+      </div>
+
+      <button
+        onClick={createTransform}
+        disabled={loading || !selectedTemplate || !modelName}
+        style={{
+          width: '100%',
+          padding: '12px 24px',
+          backgroundColor: (loading || !selectedTemplate || !modelName) ? '#4a5568' : 'rgba(159, 122, 234, 0.2)',
+          color: '#c4b5fd',
+          border: '1px solid rgba(159, 122, 234, 0.3)',
+          borderRadius: '4px',
+          cursor: (loading || !selectedTemplate || !modelName) ? 'not-allowed' : 'pointer',
+          fontWeight: '500'
+        }}
+      >
+        {loading ? 'Creating...' : '✨ Create Transformation'}
+      </button>
+
+      {message && (
+        <div style={{
+          marginTop: '20px',
+          padding: '12px',
+          backgroundColor: message.type === 'success' ? 'rgba(72, 187, 120, 0.1)' : 'rgba(245, 101, 101, 0.1)',
+          border: `1px solid ${message.type === 'success' ? 'rgba(72, 187, 120, 0.3)' : 'rgba(245, 101, 101, 0.3)'}`,
+          borderRadius: '4px',
+          color: message.type === 'success' ? '#68d391' : '#fc8181'
+        }}>
+          {message.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Main App component
 function App() {
   const [activeTab, setActiveTab] = useState('data');
@@ -851,6 +1356,8 @@ function App() {
       <main className="app-main">
         {activeTab === 'data' && <DataExplorer />}
         {activeTab === 'sql' && <SQLEditor />}
+        {activeTab === 'pipelines' && <PipelineCreator />}
+        {activeTab === 'transforms' && <Transforms />}
         {activeTab === 'jobs' && <Jobs />}
         {activeTab === 'ask' && <AskData />}
       </main>

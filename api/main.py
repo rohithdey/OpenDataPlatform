@@ -68,6 +68,23 @@ class TableInfo(BaseModel):
     columns: List[Dict[str, str]]
     row_count: int
 
+class YahooFinanceConfig(BaseModel):
+    dag_id: str
+    description: str
+    symbols: List[str]  # e.g., ["AAPL", "TSLA", "MSFT"]
+    period: str = "1y"  # 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max
+    interval: str = "1d"  # 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo
+    schedule: str  # cron expression
+    target_table: str
+
+class DBTTemplate(BaseModel):
+    template_id: str
+    model_name: str
+    source_table: str
+    parameters: Dict[str, Any]  # Template-specific parameters
+    schedule: Optional[str] = None  # Optional cron schedule
+    run_after_dag: Optional[str] = None  # Run after specific DAG completes
+
 # Database connection helper
 def get_db_connection(read_only=True):
     """Get DuckDB connection - uses read_only by default to avoid locks"""
@@ -773,6 +790,198 @@ with DAG(
 '''
     return dag_code
 
+def generate_yahoo_finance_dag(config: YahooFinanceConfig) -> str:
+    """Generate Python DAG code for Yahoo Finance data ingestion"""
+
+    symbols_str = ", ".join([f"'{s}'" for s in config.symbols])
+
+    dag_code = f'''"""
+Auto-generated DAG: {config.dag_id}
+Description: {config.description}
+Source: Yahoo Finance API
+Symbols: {", ".join(config.symbols)}
+"""
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+import duckdb
+import pandas as pd
+import yfinance as yf
+
+default_args = {{
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}}
+
+def fetch_yahoo_finance_data():
+    """Fetch stock data from Yahoo Finance and load to DuckDB"""
+    symbols = [{symbols_str}]
+    period = '{config.period}'
+    interval = '{config.interval}'
+
+    all_data = []
+
+    for symbol in symbols:
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period, interval=interval)
+
+            if not df.empty:
+                df = df.reset_index()
+                df['symbol'] = symbol
+                df['fetched_at'] = datetime.now()
+
+                # Rename columns to lowercase for DuckDB
+                df.columns = [col.lower().replace(' ', '_') for col in df.columns]
+
+                all_data.append(df)
+                print(f"Fetched {{len(df)}} rows for {{symbol}}")
+            else:
+                print(f"No data available for {{symbol}}")
+        except Exception as e:
+            print(f"Error fetching data for {{symbol}}: {{e}}")
+
+    if not all_data:
+        raise ValueError("No data fetched from Yahoo Finance")
+
+    # Combine all dataframes
+    combined_df = pd.concat(all_data, ignore_index=True)
+
+    # Load to DuckDB
+    conn = duckdb.connect('/opt/airflow/data/warehouse.duckdb')
+
+    # Create table if not exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS {config.target_table} (
+            date TIMESTAMP,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            volume BIGINT,
+            dividends DOUBLE,
+            stock_splits DOUBLE,
+            symbol VARCHAR,
+            fetched_at TIMESTAMP
+        )
+    """)
+
+    # Insert data
+    conn.execute(f"INSERT INTO {config.target_table} SELECT * FROM combined_df")
+    conn.close()
+
+    return f"Loaded {{len(combined_df)}} rows to {config.target_table}"
+
+with DAG(
+    '{config.dag_id}',
+    default_args=default_args,
+    description='{config.description}',
+    schedule_interval='{config.schedule}',
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=['yahoo-finance', 'auto-generated'],
+) as dag:
+
+    fetch_task = PythonOperator(
+        task_id='fetch_yahoo_finance_data',
+        python_callable=fetch_yahoo_finance_data,
+    )
+'''
+    return dag_code
+
+# ============== Yahoo Finance DAG Endpoints ==============
+
+@app.post("/dags/yahoo-finance/create")
+async def create_yahoo_finance_dag(config: YahooFinanceConfig):
+    """Create a Yahoo Finance data ingestion DAG"""
+    try:
+        dag_code = generate_yahoo_finance_dag(config)
+
+        # Write DAG file
+        dag_path = f"/app/dags/{config.dag_id}.py"
+        with open(dag_path, 'w') as f:
+            f.write(dag_code)
+
+        return {
+            "message": f"Yahoo Finance DAG '{config.dag_id}' created successfully",
+            "path": dag_path,
+            "symbols": config.symbols,
+            "target_table": config.target_table
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/dags/yahoo-finance/fetch-now")
+async def fetch_yahoo_finance_now(
+    symbols: List[str] = Body(...),
+    period: str = Body("1mo"),
+    table_name: str = Body("stock_prices")
+):
+    """Immediately fetch Yahoo Finance data without creating a DAG"""
+    try:
+        import yfinance as yf
+
+        all_data = []
+
+        for symbol in symbols:
+            try:
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(period=period, interval="1d")
+
+                if not df.empty:
+                    df = df.reset_index()
+                    df['symbol'] = symbol
+                    df['fetched_at'] = datetime.now()
+
+                    # Rename columns
+                    df.columns = [col.lower().replace(' ', '_') for col in df.columns]
+
+                    all_data.append(df)
+            except Exception as e:
+                print(f"Error fetching {symbol}: {e}")
+
+        if not all_data:
+            raise HTTPException(status_code=400, detail="No data fetched")
+
+        # Combine and load
+        combined_df = pd.concat(all_data, ignore_index=True)
+
+        conn = get_db_connection(read_only=False)
+
+        # Create table if not exists
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                date TIMESTAMP,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume BIGINT,
+                dividends DOUBLE,
+                stock_splits DOUBLE,
+                symbol VARCHAR,
+                fetched_at TIMESTAMP
+            )
+        """)
+
+        # Insert data
+        conn.execute(f"INSERT INTO {table_name} SELECT * FROM combined_df")
+        conn.close()
+
+        return {
+            "message": "Data fetched successfully",
+            "rows_loaded": len(combined_df),
+            "symbols": symbols,
+            "table": table_name
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ============== DBT Integration Endpoints ==============
 
 @app.get("/dbt/models")
@@ -809,6 +1018,221 @@ async def get_dbt_model(model_name: str):
         raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============== DBT Template Endpoints ==============
+
+@app.get("/dbt/templates")
+async def list_dbt_templates():
+    """List available DBT model templates"""
+    templates = [
+        {
+            "id": "daily_returns",
+            "name": "Daily Returns Calculator",
+            "description": "Calculate daily percentage returns for stock prices",
+            "parameters": ["date_column", "value_column", "group_by_column"]
+        },
+        {
+            "id": "moving_averages",
+            "name": "Moving Averages",
+            "description": "Calculate moving averages (7-day, 30-day, 90-day)",
+            "parameters": ["date_column", "value_column", "group_by_column", "windows"]
+        },
+        {
+            "id": "volatility",
+            "name": "Volatility Calculator",
+            "description": "Calculate rolling volatility (standard deviation of returns)",
+            "parameters": ["date_column", "value_column", "group_by_column", "window"]
+        },
+        {
+            "id": "yoy_growth",
+            "name": "Year-over-Year Growth",
+            "description": "Calculate YoY growth percentages",
+            "parameters": ["date_column", "value_column", "group_by_column"]
+        }
+    ]
+    return {"templates": templates}
+
+@app.post("/dbt/create-from-template")
+async def create_dbt_from_template(config: DBTTemplate):
+    """Create a DBT model from a template"""
+    try:
+        models_path = Path("/app/dbt/models")
+        models_path.mkdir(parents=True, exist_ok=True)
+
+        template_id = config.template_id
+        model_name = config.model_name
+        source_table = config.source_table
+        params = config.parameters
+
+        # Generate SQL based on template
+        if template_id == "daily_returns":
+            sql_content = f"""-- Daily Returns Calculator
+-- Calculates daily percentage returns
+
+WITH daily_data AS (
+    SELECT
+        {params.get('date_column', 'date')} as date,
+        {params.get('group_by_column', 'symbol')} as group_key,
+        {params.get('value_column', 'close')} as value
+    FROM {{{{ source('{source_table.split('.')[0] if '.' in source_table else 'main'}', '{source_table.split('.')[-1] if '.' in source_table else source_table}') }}}}
+),
+with_prev AS (
+    SELECT
+        *,
+        LAG(value) OVER (PARTITION BY group_key ORDER BY date) as prev_value
+    FROM daily_data
+)
+SELECT
+    date,
+    group_key as {params.get('group_by_column', 'symbol')},
+    value,
+    prev_value,
+    CASE
+        WHEN prev_value IS NOT NULL AND prev_value != 0
+        THEN ((value - prev_value) / prev_value) * 100
+        ELSE NULL
+    END as daily_return_pct
+FROM with_prev
+ORDER BY group_key, date
+"""
+
+        elif template_id == "moving_averages":
+            windows = params.get('windows', [7, 30, 90])
+            ma_columns = []
+            for window in windows:
+                ma_columns.append(f"""
+        AVG(value) OVER (
+            PARTITION BY group_key
+            ORDER BY date
+            ROWS BETWEEN {window-1} PRECEDING AND CURRENT ROW
+        ) as ma_{window}d""")
+
+            sql_content = f"""-- Moving Averages
+-- Calculates {', '.join([f'{w}-day' for w in windows])} moving averages
+
+WITH daily_data AS (
+    SELECT
+        {params.get('date_column', 'date')} as date,
+        {params.get('group_by_column', 'symbol')} as group_key,
+        {params.get('value_column', 'close')} as value
+    FROM {{{{ source('{source_table.split('.')[0] if '.' in source_table else 'main'}', '{source_table.split('.')[-1] if '.' in source_table else source_table}') }}}}
+)
+SELECT
+    date,
+    group_key as {params.get('group_by_column', 'symbol')},
+    value,{','.join(ma_columns)}
+FROM daily_data
+ORDER BY group_key, date
+"""
+
+        elif template_id == "volatility":
+            window = params.get('window', 30)
+            sql_content = f"""-- Volatility Calculator
+-- Calculates {window}-day rolling volatility
+
+WITH daily_data AS (
+    SELECT
+        {params.get('date_column', 'date')} as date,
+        {params.get('group_by_column', 'symbol')} as group_key,
+        {params.get('value_column', 'close')} as value
+    FROM {{{{ source('{source_table.split('.')[0] if '.' in source_table else 'main'}', '{source_table.split('.')[-1] if '.' in source_table else source_table}') }}}}
+),
+with_returns AS (
+    SELECT
+        *,
+        LAG(value) OVER (PARTITION BY group_key ORDER BY date) as prev_value,
+        CASE
+            WHEN LAG(value) OVER (PARTITION BY group_key ORDER BY date) IS NOT NULL
+            THEN ((value - LAG(value) OVER (PARTITION BY group_key ORDER BY date)) /
+                  LAG(value) OVER (PARTITION BY group_key ORDER BY date))
+            ELSE NULL
+        END as daily_return
+    FROM daily_data
+)
+SELECT
+    date,
+    group_key as {params.get('group_by_column', 'symbol')},
+    value,
+    daily_return,
+    STDDEV(daily_return) OVER (
+        PARTITION BY group_key
+        ORDER BY date
+        ROWS BETWEEN {window-1} PRECEDING AND CURRENT ROW
+    ) * SQRT(252) as volatility_{window}d_annualized
+FROM with_returns
+ORDER BY group_key, date
+"""
+
+        elif template_id == "yoy_growth":
+            sql_content = f"""-- Year-over-Year Growth
+-- Calculates YoY growth percentages
+
+WITH daily_data AS (
+    SELECT
+        {params.get('date_column', 'date')} as date,
+        {params.get('group_by_column', 'symbol')} as group_key,
+        {params.get('value_column', 'close')} as value
+    FROM {{{{ source('{source_table.split('.')[0] if '.' in source_table else 'main'}', '{source_table.split('.')[-1] if '.' in source_table else source_table}') }}}}
+),
+with_yoy AS (
+    SELECT
+        *,
+        LAG(value, 365) OVER (PARTITION BY group_key ORDER BY date) as value_1y_ago
+    FROM daily_data
+)
+SELECT
+    date,
+    group_key as {params.get('group_by_column', 'symbol')},
+    value,
+    value_1y_ago,
+    CASE
+        WHEN value_1y_ago IS NOT NULL AND value_1y_ago != 0
+        THEN ((value - value_1y_ago) / value_1y_ago) * 100
+        ELSE NULL
+    END as yoy_growth_pct
+FROM with_yoy
+ORDER BY group_key, date
+"""
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown template: {template_id}")
+
+        # Write the SQL file
+        model_file = models_path / f"{model_name}.sql"
+        with open(model_file, 'w') as f:
+            f.write(sql_content)
+
+        return {
+            "message": f"DBT model '{model_name}' created successfully",
+            "template": template_id,
+            "path": str(model_file)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/dbt/run/{model_name}")
+async def run_dbt_model(model_name: str):
+    """Run a specific DBT model"""
+    try:
+        import subprocess
+
+        # Run dbt for this model
+        result = subprocess.run(
+            ["dbt", "run", "--select", model_name, "--project-dir", "/app/dbt"],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        return {
+            "message": f"DBT model '{model_name}' executed",
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
