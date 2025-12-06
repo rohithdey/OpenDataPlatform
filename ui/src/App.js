@@ -841,10 +841,15 @@ function PipelineCreator() {
   const [scheduleMode, setScheduleMode] = useState('natural'); // 'natural', 'visual', 'manual'
   const [naturalLanguage, setNaturalLanguage] = useState('weekdays at 4pm');
   const [cronDescription, setCronDescription] = useState('Weekdays at 4:00 PM');
-  const [visualFrequency, setVisualFrequency] = useState('daily');
+  const [visualFrequency, setVisualFrequency] = useState('weekdays');
   const [visualHour, setVisualHour] = useState('16');
   const [visualMinute, setVisualMinute] = useState('0');
   const [visualDays, setVisualDays] = useState('1-5');
+
+  // Initialize cron description on mount
+  useEffect(() => {
+    updateCronDescription(schedule);
+  }, []);
 
   const createDAG = async () => {
     setLoading(true);

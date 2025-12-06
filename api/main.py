@@ -948,7 +948,64 @@ async def parse_natural_language_to_cron(text: str = Body(..., embed=True)):
                 "input": text
             }
 
-    # If no pattern matches, return error
+    # If regex didn't match, try Ollama for complex patterns
+    try:
+        import httpx
+        import json
+
+        prompt = f"""You are a cron expression generator. Convert natural language into a valid cron expression.
+
+Natural language: "{text}"
+
+Important rules:
+- Cron format: minute hour day-of-month month day-of-week (5 fields)
+- Day of week: 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday
+- "except" means exclude days (e.g., "every day except sunday" = Mon-Sat = "* * * * 1-6")
+- "every day except sundays" at specific time = "minute hour * * 1-6"
+- Weekdays = Monday-Friday = 1-5
+- Weekends = Saturday-Sunday = 0,6
+
+Examples:
+- "every day except sundays at 8pm" → {{"cron": "0 20 * * 1-6", "description": "Every day except Sunday at 8:00 PM"}}
+- "weekdays at 9am" → {{"cron": "0 9 * * 1-5", "description": "Weekdays at 9:00 AM"}}
+- "every 30 minutes" → {{"cron": "*/30 * * * *", "description": "Every 30 minutes"}}
+
+Respond with ONLY a JSON object, no markdown formatting:
+{{"cron": "minute hour day month weekday", "description": "Human readable description"}}"""
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "http://ollama:11434/api/generate",
+                json={
+                    "model": "llama3.2:latest",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.1}
+                }
+            )
+
+            if response.status_code == 200:
+                ollama_response = response.json()["response"].strip()
+
+                # Try to extract JSON from response
+                # Remove markdown code blocks if present
+                ollama_response = re.sub(r'```json\s*', '', ollama_response)
+                ollama_response = re.sub(r'```\s*', '', ollama_response)
+
+                try:
+                    result = json.loads(ollama_response)
+                    if "cron" in result:
+                        # Validate cron format
+                        cron_parts = result["cron"].split()
+                        if len(cron_parts) == 5:
+                            result["input"] = text
+                            return result
+                except json.JSONDecodeError as e:
+                    print(f"JSON decode error: {e}, response: {ollama_response}")
+    except Exception as e:
+        print(f"Ollama parsing error: {e}")
+
+    # If Ollama also failed, return error
     return {
         "error": "Could not parse natural language. Try: 'daily at 5pm', 'every 30 minutes', 'weekdays at 9am'",
         "input": text
@@ -1103,6 +1160,7 @@ async def fetch_yahoo_finance_now(
 
         all_data = []
 
+        fetch_errors = []
         for symbol in symbols:
             try:
                 ticker = yf.Ticker(symbol)
@@ -1117,11 +1175,16 @@ async def fetch_yahoo_finance_now(
                     df.columns = [col.lower().replace(' ', '_') for col in df.columns]
 
                     all_data.append(df)
+                else:
+                    fetch_errors.append(f"{symbol}: No data returned for period {period}")
             except Exception as e:
+                error_msg = f"{symbol}: {str(e)}"
                 print(f"Error fetching {symbol}: {e}")
+                fetch_errors.append(error_msg)
 
         if not all_data:
-            raise HTTPException(status_code=400, detail="No data fetched")
+            error_detail = "No data fetched. " + (" | ".join(fetch_errors) if fetch_errors else "Check symbol names and try again.")
+            raise HTTPException(status_code=400, detail=error_detail)
 
         # Combine and load
         combined_df = pd.concat(all_data, ignore_index=True)
