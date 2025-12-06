@@ -952,6 +952,19 @@ async def parse_natural_language_to_cron(text: str = Body(..., embed=True)):
     try:
         import httpx
         import json
+        import os
+
+        # Determine Ollama host (Mac native or Docker)
+        ollama_host = os.getenv("OLLAMA_HOST", None)
+
+        if not ollama_host:
+            # Try to detect Mac native Ollama first
+            ollama_hosts_to_try = [
+                "http://host.docker.internal:11434",  # Mac native Ollama
+                "http://ollama:11434"  # Docker Ollama
+            ]
+        else:
+            ollama_hosts_to_try = [ollama_host]
 
         prompt = f"""You are a cron expression generator. Convert natural language into a valid cron expression.
 
@@ -973,35 +986,46 @@ Examples:
 Respond with ONLY a JSON object, no markdown formatting:
 {{"cron": "minute hour day month weekday", "description": "Human readable description"}}"""
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                "http://ollama:11434/api/generate",
-                json={
-                    "model": "llama3.2:latest",
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.1}
-                }
-            )
+        response = None
+        for ollama_url in ollama_hosts_to_try:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.post(
+                        f"{ollama_url}/api/generate",
+                        json={
+                            "model": "llama3.2:latest",
+                            "prompt": prompt,
+                            "stream": False,
+                            "options": {"temperature": 0.1}
+                        }
+                    )
+                    if response.status_code == 200:
+                        print(f"✓ Connected to Ollama at {ollama_url}")
+                        break
+            except Exception as e:
+                print(f"Failed to connect to Ollama at {ollama_url}: {e}")
+                continue
 
-            if response.status_code == 200:
-                ollama_response = response.json()["response"].strip()
+        if not response or response.status_code != 200:
+            raise Exception("Could not connect to Ollama")
 
-                # Try to extract JSON from response
-                # Remove markdown code blocks if present
-                ollama_response = re.sub(r'```json\s*', '', ollama_response)
-                ollama_response = re.sub(r'```\s*', '', ollama_response)
+        ollama_response = response.json()["response"].strip()
 
-                try:
-                    result = json.loads(ollama_response)
-                    if "cron" in result:
-                        # Validate cron format
-                        cron_parts = result["cron"].split()
-                        if len(cron_parts) == 5:
-                            result["input"] = text
-                            return result
-                except json.JSONDecodeError as e:
-                    print(f"JSON decode error: {e}, response: {ollama_response}")
+        # Try to extract JSON from response
+        # Remove markdown code blocks if present
+        ollama_response = re.sub(r'```json\s*', '', ollama_response)
+        ollama_response = re.sub(r'```\s*', '', ollama_response)
+
+        try:
+            result = json.loads(ollama_response)
+            if "cron" in result:
+                # Validate cron format
+                cron_parts = result["cron"].split()
+                if len(cron_parts) == 5:
+                    result["input"] = text
+                    return result
+        except json.JSONDecodeError as e:
+            print(f"JSON decode error: {e}, response: {ollama_response}")
     except Exception as e:
         print(f"Ollama parsing error: {e}")
 
