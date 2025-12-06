@@ -949,6 +949,7 @@ async def parse_natural_language_to_cron(text: str = Body(..., embed=True)):
             }
 
     # If regex didn't match, try Ollama for complex patterns
+    ollama_error = None
     try:
         import httpx
         import json
@@ -987,6 +988,7 @@ Respond with ONLY a JSON object, no markdown formatting:
 {{"cron": "minute hour day month weekday", "description": "Human readable description"}}"""
 
         response = None
+        connection_errors = []
         for ollama_url in ollama_hosts_to_try:
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1002,12 +1004,17 @@ Respond with ONLY a JSON object, no markdown formatting:
                     if response.status_code == 200:
                         print(f"✓ Connected to Ollama at {ollama_url}")
                         break
+                    else:
+                        connection_errors.append(f"{ollama_url}: HTTP {response.status_code}")
             except Exception as e:
+                error_msg = f"{ollama_url}: {str(e)}"
                 print(f"Failed to connect to Ollama at {ollama_url}: {e}")
+                connection_errors.append(error_msg)
                 continue
 
         if not response or response.status_code != 200:
-            raise Exception("Could not connect to Ollama")
+            ollama_error = "Ollama not available. Tried: " + " | ".join(connection_errors)
+            raise Exception(ollama_error)
 
         ollama_response = response.json()["response"].strip()
 
@@ -1025,13 +1032,20 @@ Respond with ONLY a JSON object, no markdown formatting:
                     result["input"] = text
                     return result
         except json.JSONDecodeError as e:
+            ollama_error = f"Ollama returned invalid JSON: {ollama_response[:100]}"
             print(f"JSON decode error: {e}, response: {ollama_response}")
     except Exception as e:
+        if not ollama_error:
+            ollama_error = str(e)
         print(f"Ollama parsing error: {e}")
 
-    # If Ollama also failed, return error
+    # If Ollama also failed, return error with details
+    error_msg = "Could not parse natural language. Try: 'daily at 5pm', 'every 30 minutes', 'weekdays at 9am'"
+    if ollama_error:
+        error_msg += f" (Ollama: {ollama_error})"
+
     return {
-        "error": "Could not parse natural language. Try: 'daily at 5pm', 'every 30 minutes', 'weekdays at 9am'",
+        "error": error_msg,
         "input": text
     }
 
@@ -1187,8 +1201,13 @@ async def fetch_yahoo_finance_now(
         fetch_errors = []
         for symbol in symbols:
             try:
+                print(f"Fetching {symbol} with period={period}...")
                 ticker = yf.Ticker(symbol)
+
+                # Try fetching data
                 df = ticker.history(period=period, interval="1d")
+
+                print(f"  {symbol}: Got {len(df)} rows")
 
                 if not df.empty:
                     df = df.reset_index()
@@ -1198,12 +1217,27 @@ async def fetch_yahoo_finance_now(
                     # Rename columns
                     df.columns = [col.lower().replace(' ', '_') for col in df.columns]
 
+                    print(f"  {symbol}: Columns: {list(df.columns)}")
                     all_data.append(df)
                 else:
-                    fetch_errors.append(f"{symbol}: No data returned for period {period}")
+                    # Try to get more info about why it's empty
+                    info_msg = f"{symbol}: No data returned"
+                    try:
+                        # Check if ticker info is available
+                        info = ticker.info
+                        if 'symbol' in info:
+                            info_msg += f" (ticker exists, but no history for period={period})"
+                        else:
+                            info_msg += " (ticker may not exist)"
+                    except:
+                        info_msg += " (could not verify ticker)"
+
+                    fetch_errors.append(info_msg)
             except Exception as e:
-                error_msg = f"{symbol}: {str(e)}"
+                error_msg = f"{symbol}: {type(e).__name__}: {str(e)}"
                 print(f"Error fetching {symbol}: {e}")
+                import traceback
+                traceback.print_exc()
                 fetch_errors.append(error_msg)
 
         if not all_data:
