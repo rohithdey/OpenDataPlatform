@@ -894,6 +894,181 @@ with DAG(
 '''
     return dag_code
 
+# ============== Cron Helper Endpoints ==============
+
+@app.post("/cron/parse")
+async def parse_natural_language_to_cron(text: str = Body(..., embed=True)):
+    """Convert natural language to cron expression"""
+    text = text.lower().strip()
+
+    # Common patterns
+    patterns = {
+        # Every X minutes
+        r'every (\d+) minutes?': lambda m: f'*/{m.group(1)} * * * *',
+        r'every minute': lambda m: '* * * * *',
+
+        # Every X hours
+        r'every (\d+) hours?': lambda m: f'0 */{m.group(1)} * * *',
+        r'every hour': lambda m: '0 * * * *',
+        r'hourly': lambda m: '0 * * * *',
+
+        # Daily at specific time
+        r'daily at (\d+):(\d+)\s*(am|pm)?': lambda m: _parse_daily_time(m),
+        r'every day at (\d+):(\d+)\s*(am|pm)?': lambda m: _parse_daily_time(m),
+        r'daily at (\d+)\s*(am|pm)': lambda m: _parse_daily_hour(m),
+        r'every day at (\d+)\s*(am|pm)': lambda m: _parse_daily_hour(m),
+
+        # Specific days
+        r'weekdays at (\d+):(\d+)\s*(am|pm)?': lambda m: _parse_weekday_time(m),
+        r'weekdays at (\d+)\s*(am|pm)': lambda m: _parse_weekday_hour(m),
+        r'weekends at (\d+):(\d+)\s*(am|pm)?': lambda m: _parse_weekend_time(m),
+
+        # Weekly
+        r'weekly on (\w+) at (\d+):(\d+)\s*(am|pm)?': lambda m: _parse_weekly(m),
+        r'every (\w+) at (\d+):(\d+)\s*(am|pm)?': lambda m: _parse_weekly_alt(m),
+
+        # Monthly
+        r'monthly on day (\d+) at (\d+):(\d+)\s*(am|pm)?': lambda m: _parse_monthly(m),
+        r'first day of month at (\d+):(\d+)\s*(am|pm)?': lambda m: f'{m.group(2)} {_convert_hour(m.group(1), m.group(3) if len(m.groups()) >= 3 else None)} 1 * *',
+
+        # Special cases
+        r'daily': lambda m: '0 0 * * *',
+        r'midnight': lambda m: '0 0 * * *',
+        r'noon': lambda m: '0 12 * * *',
+    }
+
+    import re
+    for pattern, converter in patterns.items():
+        match = re.search(pattern, text)
+        if match:
+            cron = converter(match)
+            return {
+                "cron": cron,
+                "description": _cron_to_description(cron),
+                "input": text
+            }
+
+    # If no pattern matches, return error
+    return {
+        "error": "Could not parse natural language. Try: 'daily at 5pm', 'every 30 minutes', 'weekdays at 9am'",
+        "input": text
+    }
+
+def _convert_hour(hour: str, meridiem: str = None) -> str:
+    """Convert 12-hour to 24-hour format"""
+    h = int(hour)
+    if meridiem:
+        if meridiem.lower() == 'pm' and h != 12:
+            h += 12
+        elif meridiem.lower() == 'am' and h == 12:
+            h = 0
+    return str(h)
+
+def _parse_daily_time(match):
+    """Parse daily at HH:MM"""
+    hour = _convert_hour(match.group(1), match.group(3) if len(match.groups()) >= 3 else None)
+    minute = match.group(2)
+    return f'{minute} {hour} * * *'
+
+def _parse_daily_hour(match):
+    """Parse daily at HH (no minutes)"""
+    hour = _convert_hour(match.group(1), match.group(2))
+    return f'0 {hour} * * *'
+
+def _parse_weekday_time(match):
+    """Parse weekdays at HH:MM"""
+    hour = _convert_hour(match.group(1), match.group(3) if len(match.groups()) >= 3 else None)
+    minute = match.group(2)
+    return f'{minute} {hour} * * 1-5'
+
+def _parse_weekday_hour(match):
+    """Parse weekdays at HH"""
+    hour = _convert_hour(match.group(1), match.group(2))
+    return f'0 {hour} * * 1-5'
+
+def _parse_weekend_time(match):
+    """Parse weekends at HH:MM"""
+    hour = _convert_hour(match.group(1), match.group(3) if len(match.groups()) >= 3 else None)
+    minute = match.group(2)
+    return f'{minute} {hour} * * 0,6'
+
+def _parse_weekly(match):
+    """Parse weekly on DAY at HH:MM"""
+    days = {'monday': '1', 'tuesday': '2', 'wednesday': '3', 'thursday': '4',
+            'friday': '5', 'saturday': '6', 'sunday': '0'}
+    day = days.get(match.group(1).lower(), '0')
+    hour = _convert_hour(match.group(2), match.group(4) if len(match.groups()) >= 4 else None)
+    minute = match.group(3)
+    return f'{minute} {hour} * * {day}'
+
+def _parse_weekly_alt(match):
+    """Parse every DAY at HH:MM"""
+    days = {'monday': '1', 'tuesday': '2', 'wednesday': '3', 'thursday': '4',
+            'friday': '5', 'saturday': '6', 'sunday': '0'}
+    day = days.get(match.group(1).lower(), '0')
+    hour = _convert_hour(match.group(2), match.group(4) if len(match.groups()) >= 4 else None)
+    minute = match.group(3)
+    return f'{minute} {hour} * * {day}'
+
+def _parse_monthly(match):
+    """Parse monthly on day X at HH:MM"""
+    day = match.group(1)
+    hour = _convert_hour(match.group(2), match.group(4) if len(match.groups()) >= 4 else None)
+    minute = match.group(3)
+    return f'{minute} {hour} {day} * *'
+
+def _cron_to_description(cron: str) -> str:
+    """Convert cron expression to human-readable description"""
+    parts = cron.split()
+    if len(parts) != 5:
+        return "Invalid cron expression"
+
+    minute, hour, day, month, weekday = parts
+
+    # Special cases
+    if cron == '* * * * *':
+        return "Every minute"
+    if cron == '0 * * * *':
+        return "Every hour"
+    if cron == '0 0 * * *':
+        return "Daily at midnight"
+    if cron == '0 12 * * *':
+        return "Daily at noon"
+
+    # Build description
+    desc_parts = []
+
+    # Frequency
+    if minute.startswith('*/'):
+        desc_parts.append(f"Every {minute[2:]} minutes")
+    elif hour.startswith('*/'):
+        desc_parts.append(f"Every {hour[2:]} hours")
+    elif weekday == '1-5':
+        desc_parts.append("Weekdays")
+    elif weekday == '0,6':
+        desc_parts.append("Weekends")
+    elif weekday != '*':
+        days = {'0': 'Sunday', '1': 'Monday', '2': 'Tuesday', '3': 'Wednesday',
+                '4': 'Thursday', '5': 'Friday', '6': 'Saturday'}
+        desc_parts.append(f"Every {days.get(weekday, weekday)}")
+    elif day != '*':
+        desc_parts.append(f"Monthly on day {day}")
+    else:
+        desc_parts.append("Daily")
+
+    # Time
+    if hour != '*' and not hour.startswith('*/'):
+        h = int(hour)
+        m = int(minute) if minute != '*' and not minute.startswith('*/') else 0
+        meridiem = 'AM' if h < 12 else 'PM'
+        display_hour = h if h <= 12 else h - 12
+        if display_hour == 0:
+            display_hour = 12
+        time_str = f"{display_hour}:{m:02d} {meridiem}"
+        desc_parts.append(f"at {time_str}")
+
+    return " ".join(desc_parts)
+
 # ============== Yahoo Finance DAG Endpoints ==============
 
 @app.post("/dags/yahoo-finance/create")

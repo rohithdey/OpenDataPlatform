@@ -837,6 +837,15 @@ function PipelineCreator() {
   const [message, setMessage] = useState(null);
   const [fetchLoading, setFetchLoading] = useState(false);
 
+  // Cron builder state
+  const [scheduleMode, setScheduleMode] = useState('natural'); // 'natural', 'visual', 'manual'
+  const [naturalLanguage, setNaturalLanguage] = useState('weekdays at 4pm');
+  const [cronDescription, setCronDescription] = useState('Weekdays at 4:00 PM');
+  const [visualFrequency, setVisualFrequency] = useState('daily');
+  const [visualHour, setVisualHour] = useState('16');
+  const [visualMinute, setVisualMinute] = useState('0');
+  const [visualDays, setVisualDays] = useState('1-5');
+
   const createDAG = async () => {
     setLoading(true);
     setMessage(null);
@@ -880,6 +889,87 @@ function PipelineCreator() {
       setMessage({ type: 'error', text: error.response?.data?.detail || error.message });
     }
     setFetchLoading(false);
+  };
+
+  const parseNaturalLanguage = async () => {
+    try {
+      const response = await api.post('/cron/parse', { text: naturalLanguage });
+      if (response.data.error) {
+        setMessage({ type: 'error', text: response.data.error });
+      } else {
+        setSchedule(response.data.cron);
+        setCronDescription(response.data.description);
+        setMessage(null);
+      }
+    } catch (error) {
+      setMessage({ type: 'error', text: 'Failed to parse natural language' });
+    }
+  };
+
+  const buildVisualCron = () => {
+    let cron = '';
+    const minute = visualMinute || '0';
+    const hour = visualHour || '0';
+
+    if (visualFrequency === 'minutes') {
+      cron = `*/${visualMinute || 30} * * * *`;
+    } else if (visualFrequency === 'hourly') {
+      cron = `0 * * * *`;
+    } else if (visualFrequency === 'daily') {
+      cron = `${minute} ${hour} * * *`;
+    } else if (visualFrequency === 'weekdays') {
+      cron = `${minute} ${hour} * * 1-5`;
+    } else if (visualFrequency === 'weekends') {
+      cron = `${minute} ${hour} * * 0,6`;
+    } else if (visualFrequency === 'weekly') {
+      cron = `${minute} ${hour} * * ${visualDays}`;
+    } else if (visualFrequency === 'monthly') {
+      cron = `${minute} ${hour} ${visualDays} * *`;
+    }
+
+    setSchedule(cron);
+    updateCronDescription(cron);
+  };
+
+  const updateCronDescription = (cronExpr) => {
+    // Simple cron description (you could also call the backend for this)
+    const parts = cronExpr.split(' ');
+    if (parts.length === 5) {
+      const [min, hr, day, month, weekday] = parts;
+
+      if (cronExpr.includes('*/')) {
+        setCronDescription(`Every ${min.replace('*/', '')} minutes`);
+      } else if (hr === '*' && min === '0') {
+        setCronDescription('Every hour');
+      } else if (weekday === '1-5') {
+        const h = parseInt(hr);
+        const meridiem = h >= 12 ? 'PM' : 'AM';
+        const displayHour = h > 12 ? h - 12 : (h === 0 ? 12 : h);
+        setCronDescription(`Weekdays at ${displayHour}:${min.padStart(2, '0')} ${meridiem}`);
+      } else if (weekday === '0,6') {
+        const h = parseInt(hr);
+        const meridiem = h >= 12 ? 'PM' : 'AM';
+        const displayHour = h > 12 ? h - 12 : (h === 0 ? 12 : h);
+        setCronDescription(`Weekends at ${displayHour}:${min.padStart(2, '0')} ${meridiem}`);
+      } else if (weekday !== '*') {
+        const h = parseInt(hr);
+        const meridiem = h >= 12 ? 'PM' : 'AM';
+        const displayHour = h > 12 ? h - 12 : (h === 0 ? 12 : h);
+        const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        const dayName = dayNames[parseInt(weekday)] || `Day ${weekday}`;
+        setCronDescription(`Weekly on ${dayName} at ${displayHour}:${min.padStart(2, '0')} ${meridiem}`);
+      } else if (day !== '*') {
+        const h = parseInt(hr);
+        const meridiem = h >= 12 ? 'PM' : 'AM';
+        const displayHour = h > 12 ? h - 12 : (h === 0 ? 12 : h);
+        setCronDescription(`Monthly on day ${day} at ${displayHour}:${min.padStart(2, '0')} ${meridiem}`);
+      } else {
+        const h = parseInt(hr);
+        const meridiem = h >= 12 ? 'PM' : 'AM';
+        const displayHour = h > 12 ? h - 12 : (h === 0 ? 12 : h);
+        setCronDescription(`Daily at ${displayHour}:${min.padStart(2, '0')} ${meridiem}`);
+      }
+    }
   };
 
   return (
@@ -1000,26 +1090,300 @@ function PipelineCreator() {
 
         <div style={{ marginBottom: '20px' }}>
           <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500', color: '#e2e8f0' }}>
-            Schedule (Cron)
+            Schedule
           </label>
-          <input
-            type="text"
-            value={schedule}
-            onChange={(e) => setSchedule(e.target.value)}
-            placeholder="0 16 * * 1-5"
-            style={{
-              width: '100%',
+
+          {/* Mode Toggle */}
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+            <button
+              onClick={() => setScheduleMode('natural')}
+              style={{
+                padding: '8px 16px',
+                backgroundColor: scheduleMode === 'natural' ? 'rgba(66, 153, 225, 0.3)' : '#2d3748',
+                color: scheduleMode === 'natural' ? '#90cdf4' : '#a0aec0',
+                border: scheduleMode === 'natural' ? '1px solid rgba(66, 153, 225, 0.5)' : '1px solid #4a5568',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '13px',
+                fontWeight: '500'
+              }}
+            >
+              💬 Natural Language
+            </button>
+            <button
+              onClick={() => setScheduleMode('visual')}
+              style={{
+                padding: '8px 16px',
+                backgroundColor: scheduleMode === 'visual' ? 'rgba(66, 153, 225, 0.3)' : '#2d3748',
+                color: scheduleMode === 'visual' ? '#90cdf4' : '#a0aec0',
+                border: scheduleMode === 'visual' ? '1px solid rgba(66, 153, 225, 0.5)' : '1px solid #4a5568',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '13px',
+                fontWeight: '500'
+              }}
+            >
+              🎨 Visual Builder
+            </button>
+            <button
+              onClick={() => setScheduleMode('manual')}
+              style={{
+                padding: '8px 16px',
+                backgroundColor: scheduleMode === 'manual' ? 'rgba(66, 153, 225, 0.3)' : '#2d3748',
+                color: scheduleMode === 'manual' ? '#90cdf4' : '#a0aec0',
+                border: scheduleMode === 'manual' ? '1px solid rgba(66, 153, 225, 0.5)' : '1px solid #4a5568',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '13px',
+                fontWeight: '500'
+              }}
+            >
+              ⚙️ Manual
+            </button>
+          </div>
+
+          {/* Natural Language Mode */}
+          {scheduleMode === 'natural' && (
+            <div>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                <input
+                  type="text"
+                  value={naturalLanguage}
+                  onChange={(e) => setNaturalLanguage(e.target.value)}
+                  onKeyPress={(e) => e.key === 'Enter' && parseNaturalLanguage()}
+                  placeholder="e.g., daily at 5pm, every 30 minutes, weekdays at 9am"
+                  style={{
+                    flex: 1,
+                    padding: '10px',
+                    backgroundColor: '#2d3748',
+                    border: '1px solid #4a5568',
+                    borderRadius: '4px',
+                    color: '#e2e8f0'
+                  }}
+                />
+                <button
+                  onClick={parseNaturalLanguage}
+                  style={{
+                    padding: '10px 20px',
+                    backgroundColor: 'rgba(72, 187, 120, 0.2)',
+                    color: '#68d391',
+                    border: '1px solid rgba(72, 187, 120, 0.3)',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontWeight: '500'
+                  }}
+                >
+                  Parse
+                </button>
+              </div>
+              <p style={{ marginTop: '4px', fontSize: '12px', color: '#a0aec0' }}>
+                Examples: "daily at 5pm", "every 30 minutes", "weekdays at 9am", "monthly on day 15"
+              </p>
+            </div>
+          )}
+
+          {/* Visual Builder Mode */}
+          {scheduleMode === 'visual' && (
+            <div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '8px' }}>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '4px', fontSize: '13px', color: '#a0aec0' }}>
+                    Frequency
+                  </label>
+                  <select
+                    value={visualFrequency}
+                    onChange={(e) => { setVisualFrequency(e.target.value); buildVisualCron(); }}
+                    style={{
+                      width: '100%',
+                      padding: '8px',
+                      backgroundColor: '#2d3748',
+                      border: '1px solid #4a5568',
+                      borderRadius: '4px',
+                      color: '#e2e8f0',
+                      fontSize: '13px'
+                    }}
+                  >
+                    <option value="minutes">Every N Minutes</option>
+                    <option value="hourly">Hourly</option>
+                    <option value="daily">Daily</option>
+                    <option value="weekdays">Weekdays</option>
+                    <option value="weekends">Weekends</option>
+                    <option value="weekly">Weekly</option>
+                    <option value="monthly">Monthly</option>
+                  </select>
+                </div>
+
+                {visualFrequency === 'minutes' && (
+                  <div>
+                    <label style={{ display: 'block', marginBottom: '4px', fontSize: '13px', color: '#a0aec0' }}>
+                      Every N Minutes
+                    </label>
+                    <input
+                      type="number"
+                      value={visualMinute}
+                      onChange={(e) => { setVisualMinute(e.target.value); buildVisualCron(); }}
+                      min="1"
+                      max="59"
+                      style={{
+                        width: '100%',
+                        padding: '8px',
+                        backgroundColor: '#2d3748',
+                        border: '1px solid #4a5568',
+                        borderRadius: '4px',
+                        color: '#e2e8f0',
+                        fontSize: '13px'
+                      }}
+                    />
+                  </div>
+                )}
+
+                {(visualFrequency === 'daily' || visualFrequency === 'weekdays' || visualFrequency === 'weekends' || visualFrequency === 'weekly') && (
+                  <>
+                    <div>
+                      <label style={{ display: 'block', marginBottom: '4px', fontSize: '13px', color: '#a0aec0' }}>
+                        Hour (24h)
+                      </label>
+                      <input
+                        type="number"
+                        value={visualHour}
+                        onChange={(e) => { setVisualHour(e.target.value); buildVisualCron(); }}
+                        min="0"
+                        max="23"
+                        style={{
+                          width: '100%',
+                          padding: '8px',
+                          backgroundColor: '#2d3748',
+                          border: '1px solid #4a5568',
+                          borderRadius: '4px',
+                          color: '#e2e8f0',
+                          fontSize: '13px'
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', marginBottom: '4px', fontSize: '13px', color: '#a0aec0' }}>
+                        Minute
+                      </label>
+                      <input
+                        type="number"
+                        value={visualMinute}
+                        onChange={(e) => { setVisualMinute(e.target.value); buildVisualCron(); }}
+                        min="0"
+                        max="59"
+                        style={{
+                          width: '100%',
+                          padding: '8px',
+                          backgroundColor: '#2d3748',
+                          border: '1px solid #4a5568',
+                          borderRadius: '4px',
+                          color: '#e2e8f0',
+                          fontSize: '13px'
+                        }}
+                      />
+                    </div>
+                  </>
+                )}
+
+                {visualFrequency === 'weekly' && (
+                  <div style={{ gridColumn: '1 / -1' }}>
+                    <label style={{ display: 'block', marginBottom: '4px', fontSize: '13px', color: '#a0aec0' }}>
+                      Day of Week
+                    </label>
+                    <select
+                      value={visualDays}
+                      onChange={(e) => { setVisualDays(e.target.value); buildVisualCron(); }}
+                      style={{
+                        width: '100%',
+                        padding: '8px',
+                        backgroundColor: '#2d3748',
+                        border: '1px solid #4a5568',
+                        borderRadius: '4px',
+                        color: '#e2e8f0',
+                        fontSize: '13px'
+                      }}
+                    >
+                      <option value="1">Monday</option>
+                      <option value="2">Tuesday</option>
+                      <option value="3">Wednesday</option>
+                      <option value="4">Thursday</option>
+                      <option value="5">Friday</option>
+                      <option value="6">Saturday</option>
+                      <option value="0">Sunday</option>
+                    </select>
+                  </div>
+                )}
+
+                {visualFrequency === 'monthly' && (
+                  <div>
+                    <label style={{ display: 'block', marginBottom: '4px', fontSize: '13px', color: '#a0aec0' }}>
+                      Day of Month
+                    </label>
+                    <input
+                      type="number"
+                      value={visualDays}
+                      onChange={(e) => { setVisualDays(e.target.value); buildVisualCron(); }}
+                      min="1"
+                      max="31"
+                      style={{
+                        width: '100%',
+                        padding: '8px',
+                        backgroundColor: '#2d3748',
+                        border: '1px solid #4a5568',
+                        borderRadius: '4px',
+                        color: '#e2e8f0',
+                        fontSize: '13px'
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Manual Mode */}
+          {scheduleMode === 'manual' && (
+            <div>
+              <input
+                type="text"
+                value={schedule}
+                onChange={(e) => { setSchedule(e.target.value); updateCronDescription(e.target.value); }}
+                placeholder="0 16 * * 1-5"
+                style={{
+                  width: '100%',
+                  padding: '10px',
+                  backgroundColor: '#2d3748',
+                  border: '1px solid #4a5568',
+                  borderRadius: '4px',
+                  color: '#e2e8f0',
+                  fontFamily: 'monospace'
+                }}
+              />
+              <p style={{ marginTop: '4px', fontSize: '12px', color: '#a0aec0' }}>
+                Example: "0 16 * * 1-5" = 4 PM weekdays (after market close)
+              </p>
+            </div>
+          )}
+
+          {/* Current Schedule Display */}
+          {schedule && (
+            <div style={{
+              marginTop: '12px',
               padding: '10px',
-              backgroundColor: '#2d3748',
-              border: '1px solid #4a5568',
-              borderRadius: '4px',
-              color: '#e2e8f0',
-              fontFamily: 'monospace'
-            }}
-          />
-          <p style={{ marginTop: '4px', fontSize: '12px', color: '#a0aec0' }}>
-            Example: "0 16 * * 1-5" = 4 PM weekdays (after market close)
-          </p>
+              backgroundColor: 'rgba(66, 153, 225, 0.1)',
+              border: '1px solid rgba(66, 153, 225, 0.3)',
+              borderRadius: '4px'
+            }}>
+              <div style={{ fontSize: '12px', color: '#a0aec0', marginBottom: '4px' }}>Current Schedule:</div>
+              <div style={{ fontFamily: 'monospace', color: '#90cdf4', fontSize: '13px', marginBottom: '4px' }}>
+                {schedule}
+              </div>
+              {cronDescription && (
+                <div style={{ fontSize: '12px', color: '#68d391' }}>
+                  ✓ {cronDescription}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
