@@ -820,16 +820,33 @@ default_args = {{
 
 def fetch_yahoo_finance_data():
     """Fetch stock data from Yahoo Finance and load via Iceberg to DuckDB"""
+    import yfinance as yf
+
     symbols = [{symbols_str}]
     period = '{config.period}'
     interval = '{config.interval}'
+
+    # Configure yfinance session to avoid blocking
+    import requests
+    session = requests.Session()
+    session.headers.update({{
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }})
 
     all_data = []
 
     for symbol in symbols:
         try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, interval=interval)
+            print(f"Fetching {{symbol}} with period={{period}}, interval={{interval}}...")
+
+            # Use download method with custom session (more reliable than Ticker)
+            df = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                progress=False,
+                session=session
+            )
 
             if not df.empty:
                 df = df.reset_index()
@@ -840,17 +857,20 @@ def fetch_yahoo_finance_data():
                 df.columns = [col.lower().replace(' ', '_') for col in df.columns]
 
                 all_data.append(df)
-                print(f"Fetched {{len(df)}} rows for {{symbol}}")
+                print(f"✓ Fetched {{len(df)}} rows for {{symbol}}")
             else:
-                print(f"No data available for {{symbol}}")
+                print(f"⚠ No data available for {{symbol}} (period={{period}})")
         except Exception as e:
-            print(f"Error fetching data for {{symbol}}: {{e}}")
+            print(f"✗ Error fetching data for {{symbol}}: {{e}}")
+            import traceback
+            traceback.print_exc()
 
     if not all_data:
-        raise ValueError("No data fetched from Yahoo Finance")
+        raise ValueError("No data fetched from Yahoo Finance. Check network connectivity and symbol names.")
 
     # Combine all dataframes
     combined_df = pd.concat(all_data, ignore_index=True)
+    print(f"Combined {{len(combined_df)}} total rows from {{len(all_data)}} symbols")
 
     # Write to Iceberg format (Parquet files with metadata)
     import pyarrow as pa
@@ -1215,17 +1235,29 @@ async def fetch_yahoo_finance_now(
     """Immediately fetch Yahoo Finance data without creating a DAG"""
     try:
         import yfinance as yf
+        import requests
+
+        # Configure session with proper headers to avoid Yahoo blocking
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
 
         all_data = []
-
         fetch_errors = []
+
         for symbol in symbols:
             try:
                 print(f"Fetching {symbol} with period={period}...")
-                ticker = yf.Ticker(symbol)
 
-                # Try fetching data
-                df = ticker.history(period=period, interval="1d")
+                # Use download method with custom session (more reliable)
+                df = yf.download(
+                    symbol,
+                    period=period,
+                    interval="1d",
+                    progress=False,
+                    session=session
+                )
 
                 print(f"  {symbol}: Got {len(df)} rows")
 
