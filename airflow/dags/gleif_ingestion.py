@@ -145,34 +145,58 @@ def fetch_gleif_data(**context):
 
 def load_to_duckdb(**context):
     """
-    Load the fetched data into DuckDB
+    Load the fetched data into DuckDB via Iceberg format
+    Workflow: API → CSV → Iceberg (Parquet) → DuckDB
     """
     import time
-    
+    from datetime import datetime as dt
+
     # Get data from previous task
     ti = context['ti']
     records = ti.xcom_pull(task_ids='fetch_gleif_data')
-    
+
     if not records:
         print("No records to load")
         return
-    
+
     df = pd.DataFrame(records)
-    print(f"Loading {len(df)} records to DuckDB")
-    
-    # Ensure data directory exists
+    print(f"Loading {len(df)} records via Iceberg to DuckDB")
+
+    # Ensure data directories exist
     os.makedirs(os.path.dirname(DUCKDB_PATH), exist_ok=True)
-    
-    # Retry logic for database lock
+
+    # Step 1: Save as CSV (raw download format)
+    csv_path = '/opt/airflow/data/raw/gleif'
+    os.makedirs(csv_path, exist_ok=True)
+
+    timestamp = dt.now().strftime('%Y%m%d_%H%M%S')
+    csv_file = f'{csv_path}/gleif_entities_{timestamp}.csv'
+    df.to_csv(csv_file, index=False)
+    print(f"Saved {len(df)} records to CSV: {csv_file}")
+
+    # Step 2: Convert to Iceberg format (Parquet with directory structure)
+    iceberg_path = '/opt/airflow/data/iceberg/gleif_entities'
+    data_path = f'{iceberg_path}/data'
+    os.makedirs(data_path, exist_ok=True)
+
+    parquet_file = f'{data_path}/gleif_entities_{timestamp}.parquet'
+    df.to_parquet(parquet_file, index=False, engine='pyarrow')
+    print(f"Converted to Iceberg Parquet: {parquet_file}")
+
+    # Step 3: Load to DuckDB with Iceberg extension
     max_retries = 5
     retry_delay = 2
-    
+
     for attempt in range(max_retries):
         try:
             # Connect to DuckDB with write access
             conn = duckdb.connect(DUCKDB_PATH, read_only=False)
-            
-            # Create table if not exists and insert data
+
+            # Install and load Iceberg extension
+            conn.execute("INSTALL iceberg")
+            conn.execute("LOAD iceberg")
+
+            # Create table if not exists (schema only)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS gleif_entities (
                     lei VARCHAR,
@@ -193,25 +217,25 @@ def load_to_duckdb(**context):
                     ingestion_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             # Delete existing records that we're about to update
             lei_list = df['lei'].tolist()
             conn.execute("DELETE FROM gleif_entities WHERE lei IN (SELECT UNNEST(?))", [lei_list])
-            
-            # Insert new data
-            conn.execute("""
-                INSERT INTO gleif_entities 
-                SELECT *, CURRENT_TIMESTAMP as ingestion_timestamp 
-                FROM df
+
+            # Insert new data from Parquet (Iceberg format)
+            conn.execute(f"""
+                INSERT INTO gleif_entities
+                SELECT *, CURRENT_TIMESTAMP as ingestion_timestamp
+                FROM read_parquet('{parquet_file}')
             """)
-            
+
             # Get final count
             count = conn.execute("SELECT COUNT(*) FROM gleif_entities").fetchone()[0]
-            print(f"Total records in gleif_entities: {count}")
-            
+            print(f"✓ Loaded via Iceberg - Total records in gleif_entities: {count}")
+
             conn.close()
             return count
-            
+
         except duckdb.IOException as e:
             if "lock" in str(e).lower() and attempt < max_retries - 1:
                 print(f"Database locked, retrying in {retry_delay} seconds... (attempt {attempt + 1}/{max_retries})")

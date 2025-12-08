@@ -819,7 +819,7 @@ default_args = {{
 }}
 
 def fetch_yahoo_finance_data():
-    """Fetch stock data from Yahoo Finance and load to DuckDB"""
+    """Fetch stock data from Yahoo Finance and load via Iceberg to DuckDB"""
     symbols = [{symbols_str}]
     period = '{config.period}'
     interval = '{config.interval}'
@@ -852,30 +852,50 @@ def fetch_yahoo_finance_data():
     # Combine all dataframes
     combined_df = pd.concat(all_data, ignore_index=True)
 
-    # Load to DuckDB
+    # Write to Iceberg format (Parquet files with metadata)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from datetime import datetime as dt
+
+    # Create Iceberg-compatible directory structure
+    iceberg_path = f'/opt/airflow/data/iceberg/{config.target_table}'
+    data_path = f'{{iceberg_path}}/data'
+    metadata_path = f'{{iceberg_path}}/metadata'
+
+    import os
+    os.makedirs(data_path, exist_ok=True)
+    os.makedirs(metadata_path, exist_ok=True)
+
+    # Write data as Parquet (Iceberg uses Parquet)
+    timestamp = dt.now().strftime('%Y%m%d_%H%M%S')
+    parquet_file = f'{{data_path}}/data_{{timestamp}}.parquet'
+    combined_df.to_parquet(parquet_file, index=False, engine='pyarrow')
+
+    print(f"Written {{len(combined_df)}} rows to Iceberg format: {{parquet_file}}")
+
+    # Load to DuckDB with Iceberg extension
     conn = duckdb.connect('/opt/airflow/data/warehouse.duckdb')
 
-    # Create table if not exists
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS {config.target_table} (
-            date TIMESTAMP,
-            open DOUBLE,
-            high DOUBLE,
-            low DOUBLE,
-            close DOUBLE,
-            volume BIGINT,
-            dividends DOUBLE,
-            stock_splits DOUBLE,
-            symbol VARCHAR,
-            fetched_at TIMESTAMP
-        )
+    # Install and load Iceberg extension
+    conn.execute("INSTALL iceberg")
+    conn.execute("LOAD iceberg")
+
+    # Create or replace table from Parquet files
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {config.target_table} AS
+        SELECT * FROM read_parquet('{{iceberg_path}}/data/*.parquet')
+        WHERE 1=0
     """)
 
-    # Insert data
-    conn.execute(f"INSERT INTO {config.target_table} SELECT * FROM combined_df")
+    # Insert new data (append mode)
+    conn.execute(f"""
+        INSERT INTO {config.target_table}
+        SELECT * FROM read_parquet('{{parquet_file}}')
+    """)
+
     conn.close()
 
-    return f"Loaded {{len(combined_df)}} rows to {config.target_table}"
+    return f"Loaded {{len(combined_df)}} rows to {config.target_table} via Iceberg"
 
 with DAG(
     '{config.dag_id}',

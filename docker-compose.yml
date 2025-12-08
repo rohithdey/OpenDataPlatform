@@ -158,7 +158,7 @@ services:
       context: ./ui
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"  # CHANGE PORT: modify left number (e.g., "3001:3000")
+      - "8080:3000"  # UI accessible at http://localhost:8080
     environment:
       - REACT_APP_API_URL=http://localhost:8000
     depends_on:
