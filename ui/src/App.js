@@ -1376,7 +1376,7 @@ function App() {
         </div>
         <div className="header-actions">
           <a
-            href="http://localhost:8081"
+            href="http://localhost:8080"
             target="_blank"
             rel="noopener noreferrer"
             className="airflow-link"
