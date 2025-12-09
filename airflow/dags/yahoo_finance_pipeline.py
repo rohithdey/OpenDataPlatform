@@ -2,11 +2,7 @@
 Yahoo Finance Data Pipeline DAG
 Fetches stock data from Yahoo Finance and stores in DuckDB with Iceberg-style versioning.
 
-Features:
-- User-Agent headers to avoid blocking
-- Timestamped Parquet files for version history (Iceberg-style)
-- Retry logic with exponential backoff
-- Data validation before storage
+Uses yf.download() which is more reliable than Ticker.history() for bulk fetches.
 """
 
 from airflow import DAG
@@ -14,15 +10,11 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 import os
 import pandas as pd
-import requests
 
 # Configuration
 DATA_DIR = '/opt/airflow/data'
 DUCKDB_PATH = '/opt/airflow/data/warehouse.duckdb'
 ICEBERG_DIR = '/opt/airflow/data/iceberg/stock_prices/data'
-
-# User-Agent to avoid Yahoo blocking
-USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 default_args = {
     'owner': 'airflow',
@@ -30,14 +22,14 @@ default_args = {
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 3,
-    'retry_delay': timedelta(minutes=2),
+    'retry_delay': timedelta(minutes=5),
 }
 
 
 def fetch_yahoo_finance_data(**context):
     """
-    Fetch stock data from Yahoo Finance using yfinance library.
-    Uses proper User-Agent headers to avoid being blocked.
+    Fetch stock data from Yahoo Finance using yf.download().
+    This method is more reliable than Ticker.history() for bulk fetches.
     """
     import yfinance as yf
     import time
@@ -47,90 +39,139 @@ def fetch_yahoo_finance_data(**context):
     conf = dag_run.conf if dag_run and dag_run.conf else {}
 
     symbols = conf.get('symbols', ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META'])
-    period = conf.get('period', '1mo')  # 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max
+    period = conf.get('period', '1mo')
 
     if isinstance(symbols, str):
-        symbols = [s.strip() for s in symbols.split(',')]
+        symbols = [s.strip().upper() for s in symbols.split(',')]
 
     print(f"[Yahoo Finance] Fetching data for symbols: {symbols}")
     print(f"[Yahoo Finance] Period: {period}")
 
-    # Create a session with proper headers
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': USER_AGENT,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    })
-
     all_data = []
-    failed_symbols = []
 
-    for symbol in symbols:
-        print(f"[Yahoo Finance] Fetching {symbol}...")
+    # Method 1: Try yf.download() with all symbols at once (faster, more reliable)
+    try:
+        print("[Yahoo Finance] Attempting bulk download...")
 
-        # Retry logic
-        max_retries = 3
-        for attempt in range(max_retries):
+        # yf.download() returns multi-index columns when downloading multiple symbols
+        df = yf.download(
+            tickers=symbols,
+            period=period,
+            group_by='ticker',
+            auto_adjust=True,
+            progress=False,
+            threads=True
+        )
+
+        if not df.empty:
+            print(f"[Yahoo Finance] Bulk download successful, processing {len(df)} rows")
+
+            # Handle single vs multiple symbols (different DataFrame structure)
+            if len(symbols) == 1:
+                # Single symbol: columns are just OHLCV
+                symbol = symbols[0]
+                df = df.reset_index()
+                df['symbol'] = symbol
+                df['fetch_timestamp'] = datetime.now().isoformat()
+                df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                all_data.append(df)
+            else:
+                # Multiple symbols: columns are multi-index (symbol, metric)
+                for symbol in symbols:
+                    try:
+                        if symbol in df.columns.get_level_values(0):
+                            symbol_df = df[symbol].copy()
+                            symbol_df = symbol_df.reset_index()
+                            symbol_df['symbol'] = symbol
+                            symbol_df['fetch_timestamp'] = datetime.now().isoformat()
+                            symbol_df.columns = [c.lower().replace(' ', '_') for c in symbol_df.columns]
+
+                            # Drop rows with all NaN values
+                            symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
+
+                            if not symbol_df.empty:
+                                all_data.append(symbol_df)
+                                print(f"[Yahoo Finance] Got {len(symbol_df)} records for {symbol}")
+                            else:
+                                print(f"[Yahoo Finance] No data for {symbol}")
+                    except Exception as e:
+                        print(f"[Yahoo Finance] Error processing {symbol}: {e}")
+
+    except Exception as e:
+        print(f"[Yahoo Finance] Bulk download failed: {e}")
+
+    # Method 2: Fallback to individual downloads if bulk failed
+    if not all_data:
+        print("[Yahoo Finance] Falling back to individual symbol downloads...")
+
+        for symbol in symbols:
             try:
-                ticker = yf.Ticker(symbol, session=session)
-                hist = ticker.history(period=period)
+                print(f"[Yahoo Finance] Fetching {symbol} individually...")
 
-                if hist.empty:
-                    print(f"[Yahoo Finance] WARNING: No data returned for {symbol}")
-                    if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)  # Exponential backoff
-                        continue
-                    failed_symbols.append(symbol)
-                    break
+                df = yf.download(
+                    tickers=symbol,
+                    period=period,
+                    auto_adjust=True,
+                    progress=False
+                )
 
-                # Reset index to get Date as a column
-                hist = hist.reset_index()
-                hist['symbol'] = symbol
-                hist['fetch_timestamp'] = datetime.now().isoformat()
+                if not df.empty:
+                    df = df.reset_index()
+                    df['symbol'] = symbol
+                    df['fetch_timestamp'] = datetime.now().isoformat()
+                    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                    all_data.append(df)
+                    print(f"[Yahoo Finance] Got {len(df)} records for {symbol}")
+                else:
+                    print(f"[Yahoo Finance] No data for {symbol}")
 
-                # Rename columns to be more DuckDB-friendly
-                hist.columns = [c.lower().replace(' ', '_') for c in hist.columns]
-
-                all_data.append(hist)
-                print(f"[Yahoo Finance] Got {len(hist)} records for {symbol}")
-                break
+                # Rate limiting
+                time.sleep(1)
 
             except Exception as e:
-                print(f"[Yahoo Finance] Error fetching {symbol} (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    failed_symbols.append(symbol)
-
-        # Be polite to Yahoo's servers
-        time.sleep(0.5)
+                print(f"[Yahoo Finance] Error fetching {symbol}: {e}")
+                time.sleep(2)
 
     if not all_data:
-        raise ValueError(f"No data fetched from Yahoo Finance. Failed symbols: {failed_symbols}")
+        raise ValueError(f"No data fetched from Yahoo Finance for symbols: {symbols}")
 
     # Combine all data
-    df = pd.concat(all_data, ignore_index=True)
-    print(f"[Yahoo Finance] Total records fetched: {len(df)}")
+    combined_df = pd.concat(all_data, ignore_index=True)
 
-    # Push to XCom as JSON (for Airflow)
-    return df.to_json(orient='records', date_format='iso')
+    # Ensure consistent column names
+    column_mapping = {
+        'date': 'date',
+        'datetime': 'date',
+        'open': 'open',
+        'high': 'high',
+        'low': 'low',
+        'close': 'close',
+        'adj_close': 'adj_close',
+        'volume': 'volume',
+        'symbol': 'symbol',
+        'fetch_timestamp': 'fetch_timestamp'
+    }
+
+    # Rename columns that exist
+    for old_name, new_name in column_mapping.items():
+        if old_name in combined_df.columns and old_name != new_name:
+            combined_df = combined_df.rename(columns={old_name: new_name})
+
+    print(f"[Yahoo Finance] Total records fetched: {len(combined_df)}")
+    print(f"[Yahoo Finance] Columns: {list(combined_df.columns)}")
+
+    # Push to XCom as JSON
+    return combined_df.to_json(orient='records', date_format='iso')
 
 
 def save_to_iceberg_style(**context):
     """
     Save data to timestamped Parquet files (Iceberg-style versioning).
-    Each run creates a new snapshot file.
     """
     import json
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    # Get data from previous task
     ti = context['ti']
     json_data = ti.xcom_pull(task_ids='fetch_yahoo_data')
 
@@ -140,24 +181,23 @@ def save_to_iceberg_style(**context):
     df = pd.read_json(json_data, orient='records')
     print(f"[Iceberg] Processing {len(df)} records")
 
-    # Create Iceberg-style directory structure
+    # Create directory
     os.makedirs(ICEBERG_DIR, exist_ok=True)
 
-    # Generate timestamped filename (Iceberg snapshot style)
+    # Generate timestamped filename
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     snapshot_id = int(datetime.now().timestamp() * 1000)
     parquet_path = os.path.join(ICEBERG_DIR, f'snapshot_{snapshot_id}_{timestamp}.parquet')
 
-    # Convert to PyArrow table and save as Parquet
+    # Save as Parquet
     table = pa.Table.from_pandas(df)
     pq.write_table(table, parquet_path, compression='snappy')
 
     print(f"[Iceberg] Saved snapshot: {parquet_path}")
     print(f"[Iceberg] File size: {os.path.getsize(parquet_path) / 1024:.2f} KB")
 
-    # Create/update metadata file (simple manifest)
+    # Update metadata
     metadata_path = os.path.join(ICEBERG_DIR, '..', 'metadata.json')
-
     try:
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r') as f:
@@ -167,7 +207,6 @@ def save_to_iceberg_style(**context):
     except:
         metadata = {'snapshots': [], 'current_snapshot_id': None}
 
-    # Add new snapshot
     snapshot_info = {
         'snapshot_id': snapshot_id,
         'timestamp': timestamp,
@@ -179,7 +218,6 @@ def save_to_iceberg_style(**context):
     metadata['snapshots'].append(snapshot_info)
     metadata['current_snapshot_id'] = snapshot_id
 
-    # Keep only last 100 snapshots in metadata
     if len(metadata['snapshots']) > 100:
         metadata['snapshots'] = metadata['snapshots'][-100:]
 
@@ -191,13 +229,11 @@ def save_to_iceberg_style(**context):
 
 def load_to_duckdb(**context):
     """
-    Load the latest snapshot into DuckDB for querying.
-    Creates/updates the stock_prices table.
+    Load the latest snapshot into DuckDB.
     """
     import duckdb
     import time
 
-    # Get the parquet path from previous task
     ti = context['ti']
     parquet_path = ti.xcom_pull(task_ids='save_to_iceberg')
 
@@ -206,15 +242,15 @@ def load_to_duckdb(**context):
 
     print(f"[DuckDB] Loading from: {parquet_path}")
 
-    # Retry logic for database lock
     max_retries = 5
     retry_delay = 2
 
     for attempt in range(max_retries):
+        conn = None
         try:
             conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-            # Create table if not exists
+            # Create table with flexible schema
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS stock_prices (
                     date TIMESTAMP,
@@ -222,34 +258,36 @@ def load_to_duckdb(**context):
                     high DOUBLE,
                     low DOUBLE,
                     close DOUBLE,
-                    volume BIGINT,
-                    dividends DOUBLE,
-                    stock_splits DOUBLE,
+                    volume DOUBLE,
                     symbol VARCHAR,
                     fetch_timestamp VARCHAR,
                     ingestion_date DATE DEFAULT CURRENT_DATE
                 )
             """)
 
-            # Load new data (append mode - keep historical)
+            # Read parquet and get actual columns
+            parquet_df = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}') LIMIT 1").fetchdf()
+            available_cols = list(parquet_df.columns)
+            print(f"[DuckDB] Parquet columns: {available_cols}")
+
+            # Build dynamic INSERT based on available columns
+            target_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol', 'fetch_timestamp']
+
+            select_parts = []
+            for col in target_cols:
+                if col in available_cols:
+                    select_parts.append(col)
+                else:
+                    select_parts.append(f"NULL as {col}")
+
+            select_clause = ", ".join(select_parts)
+
             conn.execute(f"""
-                INSERT INTO stock_prices
-                SELECT
-                    date,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                    dividends,
-                    stock_splits,
-                    symbol,
-                    fetch_timestamp,
-                    CURRENT_DATE as ingestion_date
+                INSERT INTO stock_prices (date, open, high, low, close, volume, symbol, fetch_timestamp, ingestion_date)
+                SELECT {select_clause}, CURRENT_DATE as ingestion_date
                 FROM read_parquet('{parquet_path}')
             """)
 
-            # Get count
             count = conn.execute("SELECT COUNT(*) FROM stock_prices").fetchone()[0]
             print(f"[DuckDB] Total records in stock_prices: {count}")
 
@@ -258,13 +296,17 @@ def load_to_duckdb(**context):
 
         except duckdb.IOException as e:
             if "lock" in str(e).lower() and attempt < max_retries - 1:
-                print(f"[DuckDB] Database locked, retrying in {retry_delay}s (attempt {attempt + 1})")
+                print(f"[DuckDB] Database locked, retrying in {retry_delay}s")
+                if conn:
+                    conn.close()
                 time.sleep(retry_delay)
                 retry_delay *= 2
             else:
+                if conn:
+                    conn.close()
                 raise
         except Exception as e:
-            if 'conn' in locals():
+            if conn:
                 conn.close()
             raise
 
@@ -277,7 +319,6 @@ def create_stock_views(**context):
 
     conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-    # Daily returns view
     conn.execute("""
         CREATE OR REPLACE VIEW stock_daily_returns AS
         SELECT
@@ -286,12 +327,11 @@ def create_stock_views(**context):
             close,
             LAG(close) OVER (PARTITION BY symbol ORDER BY date) as prev_close,
             (close - LAG(close) OVER (PARTITION BY symbol ORDER BY date)) /
-                LAG(close) OVER (PARTITION BY symbol ORDER BY date) * 100 as daily_return_pct
+                NULLIF(LAG(close) OVER (PARTITION BY symbol ORDER BY date), 0) * 100 as daily_return_pct
         FROM stock_prices
         ORDER BY symbol, date
     """)
 
-    # Latest prices view
     conn.execute("""
         CREATE OR REPLACE VIEW stock_latest_prices AS
         SELECT
@@ -310,7 +350,6 @@ def create_stock_views(**context):
         )
     """)
 
-    # Summary statistics view
     conn.execute("""
         CREATE OR REPLACE VIEW stock_summary AS
         SELECT
@@ -335,7 +374,7 @@ with DAG(
     'yahoo_finance_daily',
     default_args=default_args,
     description='Fetch stock prices from Yahoo Finance with Iceberg-style versioning',
-    schedule_interval='0 18 * * 1-5',  # 6 PM on weekdays (after market close)
+    schedule_interval='0 18 * * 1-5',
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=['yahoo-finance', 'stocks', 'market-data'],
@@ -348,43 +387,14 @@ with DAG(
     dag.doc_md = """
     ## Yahoo Finance Stock Data Pipeline
 
-    Fetches stock price data from Yahoo Finance and stores it with Iceberg-style versioning.
+    Fetches stock price data using yf.download() which is more reliable than Ticker.history().
 
-    ### Configuration
-
-    You can override the defaults when triggering:
+    ### Trigger with config:
     ```json
-    {
-        "symbols": "AAPL,GOOGL,TSLA",
-        "period": "1mo"
-    }
+    {"symbols": "AAPL,GOOGL,TSLA", "period": "1mo"}
     ```
 
-    ### Period Options
-    - `1d` - 1 day
-    - `5d` - 5 days
-    - `1mo` - 1 month
-    - `3mo` - 3 months
-    - `6mo` - 6 months
-    - `1y` - 1 year
-    - `2y` - 2 years
-    - `5y` - 5 years
-    - `max` - All available data
-
-    ### Tables Created
-    - `stock_prices` - Raw price data
-    - `stock_daily_returns` - View with daily returns
-    - `stock_latest_prices` - View with most recent prices
-    - `stock_summary` - View with summary statistics
-
-    ### Iceberg-Style Versioning
-    Each run creates a timestamped Parquet file in:
-    `/opt/airflow/data/iceberg/stock_prices/data/`
-
-    Query historical snapshots with:
-    ```sql
-    SELECT * FROM read_parquet('/opt/airflow/data/iceberg/stock_prices/data/*.parquet')
-    ```
+    ### Period options: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, max
     """
 
     fetch_task = PythonOperator(

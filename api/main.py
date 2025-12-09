@@ -967,6 +967,27 @@ def parse_cron_regex(text: str) -> Optional[str]:
         minute = int(match.group(2)) if match.group(2) else 0
         return f"{minute} {hour} * * 1-5"
 
+    # Pattern: "every day except sunday at X" or "everyday except sunday at X"
+    match = re.search(r"every\s*day\s+except\s+sunday\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if match:
+        hour = parse_time(match.group(1), match.group(3))
+        minute = int(match.group(2)) if match.group(2) else 0
+        return f"{minute} {hour} * * 1-6"  # Mon-Sat
+
+    # Pattern: "every day except saturday at X"
+    match = re.search(r"every\s*day\s+except\s+saturday\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if match:
+        hour = parse_time(match.group(1), match.group(3))
+        minute = int(match.group(2)) if match.group(2) else 0
+        return f"{minute} {hour} * * 0-5"  # Sun-Fri
+
+    # Pattern: "every day except weekends at X"
+    match = re.search(r"every\s*day\s+except\s+weekends?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if match:
+        hour = parse_time(match.group(1), match.group(3))
+        minute = int(match.group(2)) if match.group(2) else 0
+        return f"{minute} {hour} * * 1-5"  # Mon-Fri
+
     # Pattern: specific day at time
     days = {
         'sunday': '0', 'monday': '1', 'tuesday': '2', 'wednesday': '3',
@@ -980,31 +1001,51 @@ def parse_cron_regex(text: str) -> Optional[str]:
             minute = int(match.group(2)) if match.group(2) else 0
             return f"{minute} {hour} * * {num}"
 
+    # Pattern: Time range with interval "X-Ypm every N minutes"
+    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+every\s+(\d+)\s+minutes?", text)
+    if match:
+        start_hour = parse_time(match.group(1), match.group(3))
+        end_hour = parse_time(match.group(4), match.group(6))
+        interval = int(match.group(7))
+        return f"*/{interval} {start_hour}-{end_hour} * * *"
+
     return None
 
-async def parse_cron_with_ollama(text: str) -> Optional[str]:
-    """Use Ollama/Llama to parse complex natural language to cron."""
+async def parse_cron_with_ollama(text: str) -> tuple[Optional[str], str]:
+    """Use Ollama/Llama to parse complex natural language to cron. Returns (cron, status_message)."""
     host = detect_ollama_host()
 
     if not host:
-        print("[Ollama] Could not connect to Ollama service")
-        return None
+        return None, "Ollama service not connected - install llama3.2 model for complex patterns"
 
-    prompt = f"""Convert the following natural language schedule to a cron expression.
-Only respond with the cron expression, nothing else.
-If you cannot convert it, respond with "INVALID".
+    # Check if model is available
+    try:
+        tags_response = requests.get(f"{host}/api/tags", timeout=5)
+        if tags_response.status_code == 200:
+            models = [m.get("name", "") for m in tags_response.json().get("models", [])]
+            if not any("llama" in m.lower() for m in models):
+                return None, f"No Llama model installed. Run: docker exec ollama ollama pull llama3.2"
+    except:
+        pass
+
+    prompt = f"""Convert this schedule to a cron expression. Only output the 5-field cron expression, nothing else.
 
 Schedule: "{text}"
 
-Cron format: minute hour day-of-month month day-of-week
-Examples:
-- "every day at 5pm" -> "0 17 * * *"
-- "every monday at 9am" -> "0 9 * * 1"
-- "every weekday at 6pm" -> "0 18 * * 1-5"
-- "every day except sunday at 10pm" -> "0 22 * * 1-6"
-- "first day of month at noon" -> "0 12 1 * *"
+Rules:
+- Cron format: minute hour day-of-month month day-of-week
+- Days: 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday
+- "every day except sunday" means days 1-6 (Mon-Sat)
+- "1-3pm every 30 minutes" means minute=*/30, hour=13-15
 
-Cron expression:"""
+Examples:
+"every day at 5pm" = 0 17 * * *
+"monday at 9am" = 0 9 * * 1
+"weekdays at 6pm" = 0 18 * * 1-5
+"every day except sunday at 10pm" = 0 22 * * 1-6
+"1pm-3pm every 30 minutes" = */30 13-15 * * *
+
+Output only the cron expression:"""
 
     try:
         response = requests.post(
@@ -1013,7 +1054,7 @@ Cron expression:"""
                 "model": "llama3.2",
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.1}
+                "options": {"temperature": 0.1, "num_predict": 50}
             },
             timeout=30
         )
@@ -1021,18 +1062,32 @@ Cron expression:"""
         if response.status_code == 200:
             result = response.json().get("response", "").strip()
 
-            # Validate it looks like a cron expression
-            if result and result != "INVALID":
-                parts = result.split()
+            # Clean up - extract just the cron expression
+            lines = result.split('\n')
+            for line in lines:
+                line = line.strip()
+                # Remove common prefixes
+                line = re.sub(r'^(cron:|output:|result:|answer:)\s*', '', line, flags=re.IGNORECASE)
+                parts = line.split()
                 if len(parts) == 5:
-                    print(f"[Ollama] Parsed '{text}' -> '{result}'")
-                    return result
+                    # Validate each part looks like cron
+                    valid = True
+                    for part in parts:
+                        if not re.match(r'^[\d\*\/\-\,]+$', part):
+                            valid = False
+                            break
+                    if valid:
+                        print(f"[Ollama] Parsed '{text}' -> '{line}'")
+                        return line, "ollama"
 
-        return None
+            return None, f"Ollama returned invalid cron: {result[:100]}"
+        else:
+            return None, f"Ollama API error: {response.status_code}"
 
+    except requests.exceptions.Timeout:
+        return None, "Ollama request timed out - model may be loading"
     except Exception as e:
-        print(f"[Ollama] Error: {e}")
-        return None
+        return None, f"Ollama error: {str(e)}"
 
 @app.post("/cron/parse")
 async def parse_cron_expression(request: CronParseRequest):
@@ -1053,7 +1108,7 @@ async def parse_cron_expression(request: CronParseRequest):
         }
 
     # Tier 2: Try Ollama for complex patterns
-    cron = await parse_cron_with_ollama(text)
+    cron, status = await parse_cron_with_ollama(text)
     if cron:
         return {
             "cron": cron,
@@ -1061,9 +1116,10 @@ async def parse_cron_expression(request: CronParseRequest):
             "input": text
         }
 
+    # If Ollama didn't work, provide helpful error
     raise HTTPException(
         status_code=400,
-        detail=f"Could not parse natural language: '{text}'. Try a simpler format like 'daily at 5pm' or 'every monday at 9am'"
+        detail=f"Could not parse: '{text}'. {status}. Try formats like 'daily at 5pm', 'every monday at 9am', 'every day except sunday at 10pm'"
     )
 
 @app.get("/cron/examples")
@@ -1078,6 +1134,7 @@ async def get_cron_examples():
             {"natural": "every monday at 10am", "cron": "0 10 * * 1"},
             {"natural": "every 15 minutes", "cron": "*/15 * * * *"},
             {"natural": "every 2 hours", "cron": "0 */2 * * *"},
+            {"natural": "every day except sunday at 10pm", "cron": "0 22 * * 1-6"},
             {"natural": "monthly", "cron": "0 0 1 * *"},
         ]
     }
