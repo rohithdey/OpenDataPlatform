@@ -128,8 +128,10 @@ services:
       - AIRFLOW_API_URL=http://airflow-webserver:8080/api/v1
       - AIRFLOW_USERNAME=admin
       - AIRFLOW_PASSWORD=admin
+      - OLLAMA_URL=http://ollama:11434
     depends_on:
       - airflow-webserver
+      - ollama
     restart: always
 
   # Frontend UI
@@ -145,5 +147,19 @@ services:
       - api
     restart: always
 
+  # Ollama for local LLMs (SQLCoder + Llama for natural language queries)
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: always
+    deploy:
+      resources:
+        reservations:
+          memory: 4G
+
 volumes:
   postgres-db-volume:
+  ollama-data:

@@ -546,6 +546,1042 @@ async def get_dbt_model(model_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============== Yahoo Finance Endpoints ==============
+
+class YahooFinanceConfig(BaseModel):
+    symbols: List[str]
+    period: str = "1mo"  # 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max
+
+class YahooFinancePipelineConfig(BaseModel):
+    symbols: List[str]
+    schedule: str  # Cron expression
+    period: str = "1mo"
+
+class CronParseRequest(BaseModel):
+    natural_language: str
+
+# Ollama configuration
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+
+def detect_ollama_host():
+    """Detect Ollama host - handles Docker vs local development"""
+    import platform
+
+    # Try docker service name first (for containerized deployment)
+    hosts_to_try = [
+        os.getenv("OLLAMA_URL", "http://ollama:11434"),
+        "http://ollama:11434",
+        "http://host.docker.internal:11434",  # Docker on Mac/Windows
+        "http://localhost:11434",  # Local development
+    ]
+
+    for host in hosts_to_try:
+        try:
+            response = requests.get(f"{host}/api/tags", timeout=2)
+            if response.status_code == 200:
+                print(f"[Ollama] Connected to {host}")
+                return host
+        except:
+            continue
+
+    return None
+
+@app.post("/yahoo-finance/fetch")
+async def fetch_yahoo_finance_now(config: YahooFinanceConfig):
+    """
+    Fetch stock data from Yahoo Finance immediately (test/preview mode).
+    Returns the data without saving to database.
+    """
+    try:
+        # Import yfinance here to handle cases where it's not installed
+        try:
+            import yfinance as yf
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="yfinance not installed. Run: pip install yfinance"
+            )
+
+        # User-Agent to avoid Yahoo blocking
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        })
+
+        all_data = []
+        errors = []
+
+        for symbol in config.symbols:
+            try:
+                ticker = yf.Ticker(symbol, session=session)
+                hist = ticker.history(period=config.period)
+
+                if hist.empty:
+                    errors.append(f"No data for {symbol}")
+                    continue
+
+                hist = hist.reset_index()
+                hist['symbol'] = symbol
+                hist.columns = [c.lower().replace(' ', '_') for c in hist.columns]
+                all_data.append(hist)
+
+            except Exception as e:
+                errors.append(f"Error fetching {symbol}: {str(e)}")
+
+        if not all_data:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No data fetched. Errors: {errors}"
+            )
+
+        df = pd.concat(all_data, ignore_index=True)
+
+        return {
+            "data": json.loads(df.to_json(orient='records', date_format='iso')),
+            "columns": list(df.columns),
+            "row_count": len(df),
+            "symbols_fetched": list(df['symbol'].unique()),
+            "errors": errors if errors else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/yahoo-finance/save")
+async def save_yahoo_finance_data(config: YahooFinanceConfig):
+    """
+    Fetch Yahoo Finance data and save to DuckDB with Iceberg-style versioning.
+    """
+    try:
+        import yfinance as yf
+
+        # User-Agent to avoid Yahoo blocking
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        })
+
+        all_data = []
+
+        for symbol in config.symbols:
+            try:
+                ticker = yf.Ticker(symbol, session=session)
+                hist = ticker.history(period=config.period)
+
+                if not hist.empty:
+                    hist = hist.reset_index()
+                    hist['symbol'] = symbol
+                    hist['fetch_timestamp'] = datetime.now().isoformat()
+                    hist.columns = [c.lower().replace(' ', '_') for c in hist.columns]
+                    all_data.append(hist)
+            except:
+                continue
+
+        if not all_data:
+            raise HTTPException(status_code=400, detail="No data fetched")
+
+        df = pd.concat(all_data, ignore_index=True)
+
+        # Save to Iceberg-style directory
+        iceberg_dir = "/app/data/iceberg/stock_prices/data"
+        os.makedirs(iceberg_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        snapshot_id = int(datetime.now().timestamp() * 1000)
+        parquet_path = f"{iceberg_dir}/snapshot_{snapshot_id}_{timestamp}.parquet"
+
+        df.to_parquet(parquet_path, engine='pyarrow', compression='snappy')
+
+        # Load to DuckDB
+        conn = get_db_connection(read_only=False)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS stock_prices (
+                date TIMESTAMP,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume BIGINT,
+                dividends DOUBLE,
+                stock_splits DOUBLE,
+                symbol VARCHAR,
+                fetch_timestamp VARCHAR,
+                ingestion_date DATE DEFAULT CURRENT_DATE
+            )
+        """)
+
+        conn.execute(f"""
+            INSERT INTO stock_prices
+            SELECT
+                date, open, high, low, close, volume, dividends, stock_splits,
+                symbol, fetch_timestamp, CURRENT_DATE as ingestion_date
+            FROM read_parquet('{parquet_path}')
+        """)
+
+        count = conn.execute("SELECT COUNT(*) FROM stock_prices").fetchone()[0]
+        conn.close()
+
+        return {
+            "message": "Data saved successfully",
+            "parquet_path": parquet_path,
+            "records_saved": len(df),
+            "total_records": count
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/yahoo-finance/create-pipeline")
+async def create_yahoo_finance_pipeline(config: YahooFinancePipelineConfig):
+    """
+    Create a scheduled Airflow DAG for Yahoo Finance data fetching.
+    """
+    try:
+        dag_id = "yahoo_finance_custom"
+        symbols_str = ",".join(config.symbols)
+
+        dag_code = f'''"""
+Auto-generated Yahoo Finance DAG
+Created: {datetime.now().isoformat()}
+"""
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+import duckdb
+import pandas as pd
+import requests
+import os
+import yfinance as yf
+
+# Configuration
+SYMBOLS = {config.symbols}
+PERIOD = "{config.period}"
+DUCKDB_PATH = '/opt/airflow/data/warehouse.duckdb'
+ICEBERG_DIR = '/opt/airflow/data/iceberg/stock_prices/data'
+
+USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+
+default_args = {{
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=2),
+}}
+
+def fetch_and_save_stock_data(**context):
+    """Fetch stock data and save with Iceberg-style versioning."""
+    import time
+
+    session = requests.Session()
+    session.headers.update({{'User-Agent': USER_AGENT}})
+
+    all_data = []
+
+    for symbol in SYMBOLS:
+        try:
+            ticker = yf.Ticker(symbol, session=session)
+            hist = ticker.history(period=PERIOD)
+
+            if not hist.empty:
+                hist = hist.reset_index()
+                hist['symbol'] = symbol
+                hist['fetch_timestamp'] = datetime.now().isoformat()
+                hist.columns = [c.lower().replace(' ', '_') for c in hist.columns]
+                all_data.append(hist)
+        except Exception as e:
+            print(f"Error fetching {{symbol}}: {{e}}")
+
+        time.sleep(0.5)
+
+    if not all_data:
+        raise ValueError("No data fetched from Yahoo Finance")
+
+    df = pd.concat(all_data, ignore_index=True)
+
+    # Save to Iceberg-style Parquet
+    os.makedirs(ICEBERG_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    snapshot_id = int(datetime.now().timestamp() * 1000)
+    parquet_path = f"{{ICEBERG_DIR}}/snapshot_{{snapshot_id}}_{{timestamp}}.parquet"
+
+    df.to_parquet(parquet_path, engine='pyarrow', compression='snappy')
+    print(f"Saved: {{parquet_path}}")
+
+    # Load to DuckDB
+    conn = duckdb.connect(DUCKDB_PATH, read_only=False)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_prices (
+            date TIMESTAMP, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+            volume BIGINT, dividends DOUBLE, stock_splits DOUBLE,
+            symbol VARCHAR, fetch_timestamp VARCHAR, ingestion_date DATE DEFAULT CURRENT_DATE
+        )
+    """)
+
+    conn.execute(f"""
+        INSERT INTO stock_prices
+        SELECT date, open, high, low, close, volume, dividends, stock_splits,
+               symbol, fetch_timestamp, CURRENT_DATE
+        FROM read_parquet('{{parquet_path}}')
+    """)
+
+    count = conn.execute("SELECT COUNT(*) FROM stock_prices").fetchone()[0]
+    conn.close()
+
+    print(f"Total records in stock_prices: {{count}}")
+    return count
+
+with DAG(
+    '{dag_id}',
+    default_args=default_args,
+    description='Yahoo Finance data pipeline - Symbols: {symbols_str}',
+    schedule_interval='{config.schedule}',
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=['yahoo-finance', 'auto-generated'],
+) as dag:
+
+    fetch_task = PythonOperator(
+        task_id='fetch_and_save_stock_data',
+        python_callable=fetch_and_save_stock_data,
+    )
+'''
+
+        # Write DAG file
+        dag_path = f"/app/dags/{dag_id}.py"
+        with open(dag_path, 'w') as f:
+            f.write(dag_code)
+
+        return {
+            "message": f"Pipeline {dag_id} created successfully",
+            "dag_id": dag_id,
+            "symbols": config.symbols,
+            "schedule": config.schedule,
+            "dag_path": dag_path
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============== Natural Language Cron Parser ==============
+
+CRON_PATTERNS = {
+    # Simple patterns - regex matching
+    r"every\s+minute": "* * * * *",
+    r"every\s+hour": "0 * * * *",
+    r"every\s+day\s+at\s+midnight": "0 0 * * *",
+    r"daily\s+at\s+midnight": "0 0 * * *",
+    r"hourly": "0 * * * *",
+    r"daily": "0 0 * * *",
+    r"weekly": "0 0 * * 0",
+    r"monthly": "0 0 1 * *",
+    r"yearly": "0 0 1 1 *",
+    r"annually": "0 0 1 1 *",
+
+    # Time-specific patterns
+    r"every\s+day\s+at\s+(\d{1,2})\s*(am|pm)?": None,  # Handle dynamically
+    r"daily\s+at\s+(\d{1,2})\s*(am|pm)?": None,
+    r"every\s+(\d+)\s+minutes?": None,
+    r"every\s+(\d+)\s+hours?": None,
+
+    # Weekday patterns
+    r"every\s+weekday": "0 9 * * 1-5",
+    r"weekdays\s+at\s+(\d{1,2})\s*(am|pm)?": None,
+    r"monday\s+to\s+friday": "0 9 * * 1-5",
+}
+
+import re
+
+def parse_time(hour_str: str, ampm: str = None) -> int:
+    """Convert hour string with optional AM/PM to 24-hour format."""
+    hour = int(hour_str)
+    if ampm:
+        ampm = ampm.lower()
+        if ampm == 'pm' and hour != 12:
+            hour += 12
+        elif ampm == 'am' and hour == 12:
+            hour = 0
+    return hour
+
+def parse_cron_regex(text: str) -> Optional[str]:
+    """Parse cron expression using regex patterns."""
+    text = text.lower().strip()
+
+    # Direct simple patterns
+    simple_patterns = {
+        "every minute": "* * * * *",
+        "every hour": "0 * * * *",
+        "hourly": "0 * * * *",
+        "daily": "0 0 * * *",
+        "weekly": "0 0 * * 0",
+        "monthly": "0 0 1 * *",
+        "yearly": "0 0 1 1 *",
+        "every weekday": "0 9 * * 1-5",
+        "weekdays": "0 9 * * 1-5",
+        "every day at midnight": "0 0 * * *",
+        "daily at midnight": "0 0 * * *",
+    }
+
+    if text in simple_patterns:
+        return simple_patterns[text]
+
+    # Pattern: "every day at X (am/pm)" or "daily at X (am/pm)"
+    match = re.search(r"(?:every\s+day|daily)\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if match:
+        hour = parse_time(match.group(1), match.group(3))
+        minute = int(match.group(2)) if match.group(2) else 0
+        return f"{minute} {hour} * * *"
+
+    # Pattern: "at X (am/pm)"
+    match = re.search(r"^at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", text)
+    if match:
+        hour = parse_time(match.group(1), match.group(3))
+        minute = int(match.group(2)) if match.group(2) else 0
+        return f"{minute} {hour} * * *"
+
+    # Pattern: "every N minutes"
+    match = re.search(r"every\s+(\d+)\s+minutes?", text)
+    if match:
+        minutes = int(match.group(1))
+        return f"*/{minutes} * * * *"
+
+    # Pattern: "every N hours"
+    match = re.search(r"every\s+(\d+)\s+hours?", text)
+    if match:
+        hours = int(match.group(1))
+        return f"0 */{hours} * * *"
+
+    # Pattern: "weekdays at X (am/pm)"
+    match = re.search(r"weekdays?\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if match:
+        hour = parse_time(match.group(1), match.group(3))
+        minute = int(match.group(2)) if match.group(2) else 0
+        return f"{minute} {hour} * * 1-5"
+
+    # Pattern: specific day at time
+    days = {
+        'sunday': '0', 'monday': '1', 'tuesday': '2', 'wednesday': '3',
+        'thursday': '4', 'friday': '5', 'saturday': '6'
+    }
+
+    for day, num in days.items():
+        match = re.search(rf"(?:every\s+)?{day}s?\s+at\s+(\d{{1,2}})(?::(\d{{2}}))?\s*(am|pm)?", text)
+        if match:
+            hour = parse_time(match.group(1), match.group(3))
+            minute = int(match.group(2)) if match.group(2) else 0
+            return f"{minute} {hour} * * {num}"
+
+    return None
+
+async def parse_cron_with_ollama(text: str) -> Optional[str]:
+    """Use Ollama/Llama to parse complex natural language to cron."""
+    host = detect_ollama_host()
+
+    if not host:
+        print("[Ollama] Could not connect to Ollama service")
+        return None
+
+    prompt = f"""Convert the following natural language schedule to a cron expression.
+Only respond with the cron expression, nothing else.
+If you cannot convert it, respond with "INVALID".
+
+Schedule: "{text}"
+
+Cron format: minute hour day-of-month month day-of-week
+Examples:
+- "every day at 5pm" -> "0 17 * * *"
+- "every monday at 9am" -> "0 9 * * 1"
+- "every weekday at 6pm" -> "0 18 * * 1-5"
+- "every day except sunday at 10pm" -> "0 22 * * 1-6"
+- "first day of month at noon" -> "0 12 1 * *"
+
+Cron expression:"""
+
+    try:
+        response = requests.post(
+            f"{host}/api/generate",
+            json={
+                "model": "llama3.2",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.1}
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            result = response.json().get("response", "").strip()
+
+            # Validate it looks like a cron expression
+            if result and result != "INVALID":
+                parts = result.split()
+                if len(parts) == 5:
+                    print(f"[Ollama] Parsed '{text}' -> '{result}'")
+                    return result
+
+        return None
+
+    except Exception as e:
+        print(f"[Ollama] Error: {e}")
+        return None
+
+@app.post("/cron/parse")
+async def parse_cron_expression(request: CronParseRequest):
+    """
+    Parse natural language schedule to cron expression.
+    Tier 1: Regex patterns for common cases
+    Tier 2: Ollama/Llama for complex patterns
+    """
+    text = request.natural_language.strip()
+
+    # Tier 1: Try regex patterns first
+    cron = parse_cron_regex(text)
+    if cron:
+        return {
+            "cron": cron,
+            "source": "regex",
+            "input": text
+        }
+
+    # Tier 2: Try Ollama for complex patterns
+    cron = await parse_cron_with_ollama(text)
+    if cron:
+        return {
+            "cron": cron,
+            "source": "ollama",
+            "input": text
+        }
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Could not parse natural language: '{text}'. Try a simpler format like 'daily at 5pm' or 'every monday at 9am'"
+    )
+
+@app.get("/cron/examples")
+async def get_cron_examples():
+    """Get example natural language to cron conversions."""
+    return {
+        "examples": [
+            {"natural": "every hour", "cron": "0 * * * *"},
+            {"natural": "daily at 5pm", "cron": "0 17 * * *"},
+            {"natural": "every day at 9:30am", "cron": "30 9 * * *"},
+            {"natural": "weekdays at 6pm", "cron": "0 18 * * 1-5"},
+            {"natural": "every monday at 10am", "cron": "0 10 * * 1"},
+            {"natural": "every 15 minutes", "cron": "*/15 * * * *"},
+            {"natural": "every 2 hours", "cron": "0 */2 * * *"},
+            {"natural": "monthly", "cron": "0 0 1 * *"},
+        ]
+    }
+
+# ============== Iceberg/Versioning Endpoints ==============
+
+@app.get("/iceberg/snapshots")
+async def list_iceberg_snapshots(table_name: str = "stock_prices"):
+    """List all Iceberg-style snapshots for a table."""
+    try:
+        iceberg_dir = f"/app/data/iceberg/{table_name}/data"
+
+        if not os.path.exists(iceberg_dir):
+            return {"snapshots": [], "message": f"No snapshots found for {table_name}"}
+
+        snapshots = []
+        for f in os.listdir(iceberg_dir):
+            if f.endswith('.parquet'):
+                file_path = os.path.join(iceberg_dir, f)
+                stat = os.stat(file_path)
+
+                # Parse snapshot info from filename
+                # Format: snapshot_{id}_{timestamp}.parquet
+                parts = f.replace('.parquet', '').split('_')
+                snapshot_id = parts[1] if len(parts) >= 2 else None
+
+                snapshots.append({
+                    "filename": f,
+                    "snapshot_id": snapshot_id,
+                    "size_bytes": stat.st_size,
+                    "size_kb": round(stat.st_size / 1024, 2),
+                    "created": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                    "path": file_path
+                })
+
+        # Sort by creation time (newest first)
+        snapshots.sort(key=lambda x: x['created'], reverse=True)
+
+        return {
+            "table": table_name,
+            "snapshot_count": len(snapshots),
+            "snapshots": snapshots
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/iceberg/query")
+async def query_iceberg_snapshot(
+    table_name: str = "stock_prices",
+    snapshot_id: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    Query Iceberg-style data. Optionally specify a snapshot for time-travel.
+    """
+    try:
+        iceberg_dir = f"/app/data/iceberg/{table_name}/data"
+
+        if not os.path.exists(iceberg_dir):
+            raise HTTPException(status_code=404, detail=f"Table {table_name} not found")
+
+        conn = get_db_connection()
+
+        if snapshot_id:
+            # Query specific snapshot
+            parquet_files = [f for f in os.listdir(iceberg_dir) if snapshot_id in f]
+            if not parquet_files:
+                raise HTTPException(status_code=404, detail=f"Snapshot {snapshot_id} not found")
+
+            file_path = os.path.join(iceberg_dir, parquet_files[0])
+            query = f"SELECT * FROM read_parquet('{file_path}') LIMIT {limit}"
+        else:
+            # Query all snapshots (current state)
+            query = f"SELECT * FROM read_parquet('{iceberg_dir}/*.parquet') LIMIT {limit}"
+
+        df = conn.execute(query).fetchdf()
+        conn.close()
+
+        return {
+            "data": df.to_dict('records'),
+            "columns": list(df.columns),
+            "row_count": len(df),
+            "snapshot_id": snapshot_id or "all"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============== DBT Templates ==============
+
+DBT_TEMPLATES = {
+    "daily_returns": {
+        "name": "Daily Returns",
+        "description": "Calculate daily percentage returns for a price column",
+        "required_columns": ["date_column", "price_column", "group_column"],
+        "template": """
+-- Daily Returns Model
+-- Generated: {{{{ current_timestamp() }}}}
+
+SELECT
+    {{{{ group_column }}}},
+    {{{{ date_column }}}},
+    {{{{ price_column }}}},
+    LAG({{{{ price_column }}}}) OVER (PARTITION BY {{{{ group_column }}}} ORDER BY {{{{ date_column }}}}) as prev_price,
+    ({{{{ price_column }}}} - LAG({{{{ price_column }}}}) OVER (PARTITION BY {{{{ group_column }}}} ORDER BY {{{{ date_column }}}})) /
+        NULLIF(LAG({{{{ price_column }}}}) OVER (PARTITION BY {{{{ group_column }}}} ORDER BY {{{{ date_column }}}}), 0) * 100 as daily_return_pct
+FROM {{{{ ref('{source_table}') }}}}
+ORDER BY {{{{ group_column }}}}, {{{{ date_column }}}}
+"""
+    },
+    "moving_average": {
+        "name": "Moving Average",
+        "description": "Calculate N-day moving average for a numeric column",
+        "required_columns": ["date_column", "value_column", "group_column", "window_size"],
+        "template": """
+-- Moving Average Model
+-- Generated: {{{{ current_timestamp() }}}}
+
+SELECT
+    {{{{ group_column }}}},
+    {{{{ date_column }}}},
+    {{{{ value_column }}}},
+    AVG({{{{ value_column }}}}) OVER (
+        PARTITION BY {{{{ group_column }}}}
+        ORDER BY {{{{ date_column }}}}
+        ROWS BETWEEN {{{{ window_size }}}} PRECEDING AND CURRENT ROW
+    ) as moving_avg_{{{{ window_size }}}}
+FROM {{{{ ref('{source_table}') }}}}
+ORDER BY {{{{ group_column }}}}, {{{{ date_column }}}}
+"""
+    },
+    "volatility": {
+        "name": "Volatility (Standard Deviation)",
+        "description": "Calculate rolling volatility for a numeric column",
+        "required_columns": ["date_column", "value_column", "group_column", "window_size"],
+        "template": """
+-- Volatility Model
+-- Generated: {{{{ current_timestamp() }}}}
+
+SELECT
+    {{{{ group_column }}}},
+    {{{{ date_column }}}},
+    {{{{ value_column }}}},
+    STDDEV({{{{ value_column }}}}) OVER (
+        PARTITION BY {{{{ group_column }}}}
+        ORDER BY {{{{ date_column }}}}
+        ROWS BETWEEN {{{{ window_size }}}} PRECEDING AND CURRENT ROW
+    ) as volatility_{{{{ window_size }}}}
+FROM {{{{ ref('{source_table}') }}}}
+ORDER BY {{{{ group_column }}}}, {{{{ date_column }}}}
+"""
+    },
+    "yoy_growth": {
+        "name": "Year-over-Year Growth",
+        "description": "Calculate year-over-year growth rate",
+        "required_columns": ["date_column", "value_column", "group_column"],
+        "template": """
+-- Year-over-Year Growth Model
+-- Generated: {{{{ current_timestamp() }}}}
+
+WITH lagged AS (
+    SELECT
+        {{{{ group_column }}}},
+        {{{{ date_column }}}},
+        {{{{ value_column }}}},
+        LAG({{{{ value_column }}}}, 365) OVER (
+            PARTITION BY {{{{ group_column }}}}
+            ORDER BY {{{{ date_column }}}}
+        ) as value_1y_ago
+    FROM {{{{ ref('{source_table}') }}}}
+)
+
+SELECT
+    {{{{ group_column }}}},
+    {{{{ date_column }}}},
+    {{{{ value_column }}}},
+    value_1y_ago,
+    ({{{{ value_column }}}} - value_1y_ago) / NULLIF(value_1y_ago, 0) * 100 as yoy_growth_pct
+FROM lagged
+WHERE value_1y_ago IS NOT NULL
+ORDER BY {{{{ group_column }}}}, {{{{ date_column }}}}
+"""
+    },
+    "aggregation": {
+        "name": "Group Aggregation",
+        "description": "Aggregate data by group with common statistics",
+        "required_columns": ["group_column", "value_column"],
+        "template": """
+-- Aggregation Model
+-- Generated: {{{{ current_timestamp() }}}}
+
+SELECT
+    {{{{ group_column }}}},
+    COUNT(*) as record_count,
+    MIN({{{{ value_column }}}}) as min_value,
+    MAX({{{{ value_column }}}}) as max_value,
+    AVG({{{{ value_column }}}}) as avg_value,
+    STDDEV({{{{ value_column }}}}) as stddev_value,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {{{{ value_column }}}}) as median_value
+FROM {{{{ ref('{source_table}') }}}}
+GROUP BY {{{{ group_column }}}}
+ORDER BY {{{{ group_column }}}}
+"""
+    }
+}
+
+class DBTTransformRequest(BaseModel):
+    template_id: str
+    source_table: str
+    output_model_name: str
+    column_mappings: Dict[str, str]
+
+@app.get("/dbt/templates")
+async def list_dbt_templates():
+    """List available DBT transformation templates."""
+    templates = []
+    for tid, template in DBT_TEMPLATES.items():
+        templates.append({
+            "id": tid,
+            "name": template["name"],
+            "description": template["description"],
+            "required_columns": template["required_columns"]
+        })
+    return {"templates": templates}
+
+@app.get("/dbt/templates/{template_id}")
+async def get_dbt_template(template_id: str):
+    """Get details of a specific DBT template."""
+    if template_id not in DBT_TEMPLATES:
+        raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
+
+    template = DBT_TEMPLATES[template_id]
+    return {
+        "id": template_id,
+        **template
+    }
+
+@app.post("/dbt/create-model")
+async def create_dbt_model(request: DBTTransformRequest):
+    """Create a new DBT model from a template."""
+    try:
+        if request.template_id not in DBT_TEMPLATES:
+            raise HTTPException(status_code=404, detail=f"Template {request.template_id} not found")
+
+        template = DBT_TEMPLATES[request.template_id]
+
+        # Validate required columns are mapped
+        for col in template["required_columns"]:
+            if col not in request.column_mappings:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required column mapping: {col}"
+                )
+
+        # Generate the model SQL
+        model_sql = template["template"].format(source_table=request.source_table)
+
+        # Replace column placeholders
+        for placeholder, actual_column in request.column_mappings.items():
+            model_sql = model_sql.replace(f"{{{{ {placeholder} }}}}", actual_column)
+
+        # Write the model file
+        models_dir = Path("/app/dbt/models")
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        model_path = models_dir / f"{request.output_model_name}.sql"
+        with open(model_path, 'w') as f:
+            f.write(model_sql)
+
+        return {
+            "message": f"DBT model {request.output_model_name} created successfully",
+            "model_path": str(model_path),
+            "template_used": request.template_id,
+            "sql_preview": model_sql[:500] + "..." if len(model_sql) > 500 else model_sql
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/dbt/run")
+async def run_dbt():
+    """Trigger DBT run (requires dbt to be installed in container)."""
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["dbt", "run", "--project-dir", "/app/dbt"],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="DBT run timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="DBT not installed in container")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============== AI Query Endpoints (Ollama Integration) ==============
+
+@app.post("/ai/sql")
+async def natural_language_to_sql(query: SemanticQuery):
+    """
+    Convert natural language question to SQL using Ollama/SQLCoder.
+    """
+    try:
+        host = detect_ollama_host()
+
+        if not host:
+            raise HTTPException(
+                status_code=503,
+                detail="Ollama service not available. Please ensure Ollama is running."
+            )
+
+        # Get table schemas for context
+        conn = get_db_connection()
+        tables = conn.execute("SHOW TABLES").fetchall()
+
+        schema_context = ""
+        for (table_name,) in tables:
+            try:
+                columns = conn.execute(f"DESCRIBE {table_name}").fetchall()
+                schema_context += f"\nTable: {table_name}\nColumns: "
+                schema_context += ", ".join([f"{col[0]} ({col[1]})" for col in columns])
+                schema_context += "\n"
+            except:
+                continue
+
+        conn.close()
+
+        prompt = f"""You are a SQL expert. Generate a DuckDB SQL query based on the user's question.
+Only respond with the SQL query, nothing else. Do not include markdown formatting.
+
+Database Schema:
+{schema_context}
+
+User Question: {query.question}
+
+SQL Query:"""
+
+        # Try SQLCoder first, fall back to Llama
+        models_to_try = ["sqlcoder", "llama3.2", "llama2"]
+
+        for model in models_to_try:
+            try:
+                response = requests.post(
+                    f"{host}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.1}
+                    },
+                    timeout=60
+                )
+
+                if response.status_code == 200:
+                    sql = response.json().get("response", "").strip()
+
+                    # Clean up the response
+                    sql = sql.replace("```sql", "").replace("```", "").strip()
+
+                    return {
+                        "sql": sql,
+                        "model_used": model,
+                        "question": query.question
+                    }
+
+            except Exception as e:
+                print(f"[AI/SQL] Error with model {model}: {e}")
+                continue
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not generate SQL. Please ensure Ollama models are installed."
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ai/explain")
+async def explain_query_results(
+    sql: str = Body(...),
+    question: str = Body(...),
+    results: List[Dict] = Body(...)
+):
+    """
+    Use Ollama/Llama to explain query results in natural language.
+    """
+    try:
+        host = detect_ollama_host()
+
+        if not host:
+            return {"explanation": "AI service not available. Here are your query results."}
+
+        # Limit results for context
+        limited_results = results[:10]
+
+        prompt = f"""You are a helpful data analyst. Explain the following query results in plain English.
+Be concise and highlight key insights.
+
+User's Question: {question}
+
+SQL Query: {sql}
+
+Results (first {len(limited_results)} rows):
+{json.dumps(limited_results, indent=2)}
+
+Explanation:"""
+
+        try:
+            response = requests.post(
+                f"{host}/api/generate",
+                json={
+                    "model": "llama3.2",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.3}
+                },
+                timeout=60
+            )
+
+            if response.status_code == 200:
+                explanation = response.json().get("response", "").strip()
+                return {"explanation": explanation}
+
+        except:
+            pass
+
+        return {"explanation": f"Query returned {len(results)} results."}
+
+    except Exception as e:
+        return {"explanation": f"Could not generate explanation: {str(e)}"}
+
+@app.get("/ollama/status")
+async def check_ollama_status():
+    """Check Ollama service status and available models."""
+    host = detect_ollama_host()
+
+    if not host:
+        return {
+            "status": "disconnected",
+            "message": "Could not connect to Ollama service",
+            "models": []
+        }
+
+    try:
+        response = requests.get(f"{host}/api/tags", timeout=5)
+
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            return {
+                "status": "connected",
+                "host": host,
+                "models": [m.get("name") for m in models]
+            }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "models": []
+        }
+
+@app.post("/ollama/pull")
+async def pull_ollama_model(model: str = Body(..., embed=True)):
+    """Pull a model to Ollama (can take several minutes)."""
+    host = detect_ollama_host()
+
+    if not host:
+        raise HTTPException(status_code=503, detail="Ollama service not available")
+
+    try:
+        # This is a long-running operation
+        response = requests.post(
+            f"{host}/api/pull",
+            json={"name": model},
+            timeout=600  # 10 minute timeout
+        )
+
+        return {
+            "message": f"Model {model} pull initiated",
+            "status": response.status_code
+        }
+
+    except requests.exceptions.Timeout:
+        return {"message": f"Model {model} pull in progress (may take several minutes)"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
