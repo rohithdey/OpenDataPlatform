@@ -602,33 +602,48 @@ async def fetch_yahoo_finance_now(config: YahooFinanceConfig):
                 detail="yfinance not installed. Run: pip install yfinance"
             )
 
-        # User-Agent to avoid Yahoo blocking
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-        })
-
+        # Use yf.download() which is more reliable than Ticker().history()
+        # Note: yfinance >= 0.2.40 doesn't work with custom requests.Session
         all_data = []
         errors = []
 
-        for symbol in config.symbols:
-            try:
-                ticker = yf.Ticker(symbol, session=session)
-                hist = ticker.history(period=config.period)
+        # Try bulk download first (faster and more reliable)
+        try:
+            df = yf.download(
+                tickers=config.symbols,
+                period=config.period,
+                group_by='ticker',
+                auto_adjust=True,
+                progress=False,
+                threads=True
+            )
 
-                if hist.empty:
-                    errors.append(f"No data for {symbol}")
-                    continue
-
-                hist = hist.reset_index()
-                hist['symbol'] = symbol
-                hist.columns = [c.lower().replace(' ', '_') for c in hist.columns]
-                all_data.append(hist)
-
-            except Exception as e:
-                errors.append(f"Error fetching {symbol}: {str(e)}")
+            if not df.empty:
+                if len(config.symbols) == 1:
+                    # Single symbol: columns are just OHLCV
+                    symbol = config.symbols[0]
+                    df = df.reset_index()
+                    df['symbol'] = symbol
+                    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                    all_data.append(df)
+                else:
+                    # Multiple symbols: columns are multi-index (symbol, metric)
+                    for symbol in config.symbols:
+                        try:
+                            if symbol in df.columns.get_level_values(0):
+                                symbol_df = df[symbol].copy()
+                                symbol_df = symbol_df.reset_index()
+                                symbol_df['symbol'] = symbol
+                                symbol_df.columns = [c.lower().replace(' ', '_') for c in symbol_df.columns]
+                                symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
+                                if not symbol_df.empty:
+                                    all_data.append(symbol_df)
+                                else:
+                                    errors.append(f"No data for {symbol}")
+                        except Exception as e:
+                            errors.append(f"Error processing {symbol}: {str(e)}")
+        except Exception as e:
+            errors.append(f"Bulk download failed: {str(e)}")
 
         if not all_data:
             raise HTTPException(
@@ -659,30 +674,47 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
     try:
         import yfinance as yf
 
-        # User-Agent to avoid Yahoo blocking
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        })
-
+        # Use yf.download() - more reliable than Ticker().history()
+        # Note: yfinance >= 0.2.40 doesn't work with custom requests.Session
         all_data = []
 
-        for symbol in config.symbols:
-            try:
-                ticker = yf.Ticker(symbol, session=session)
-                hist = ticker.history(period=config.period)
+        try:
+            df = yf.download(
+                tickers=config.symbols,
+                period=config.period,
+                group_by='ticker',
+                auto_adjust=True,
+                progress=False,
+                threads=True
+            )
 
-                if not hist.empty:
-                    hist = hist.reset_index()
-                    hist['symbol'] = symbol
-                    hist['fetch_timestamp'] = datetime.now().isoformat()
-                    hist.columns = [c.lower().replace(' ', '_') for c in hist.columns]
-                    all_data.append(hist)
-            except:
-                continue
+            if not df.empty:
+                if len(config.symbols) == 1:
+                    symbol = config.symbols[0]
+                    df = df.reset_index()
+                    df['symbol'] = symbol
+                    df['fetch_timestamp'] = datetime.now().isoformat()
+                    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                    all_data.append(df)
+                else:
+                    for symbol in config.symbols:
+                        try:
+                            if symbol in df.columns.get_level_values(0):
+                                symbol_df = df[symbol].copy()
+                                symbol_df = symbol_df.reset_index()
+                                symbol_df['symbol'] = symbol
+                                symbol_df['fetch_timestamp'] = datetime.now().isoformat()
+                                symbol_df.columns = [c.lower().replace(' ', '_') for c in symbol_df.columns]
+                                symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
+                                if not symbol_df.empty:
+                                    all_data.append(symbol_df)
+                        except:
+                            continue
+        except:
+            pass
 
         if not all_data:
-            raise HTTPException(status_code=400, detail="No data fetched")
+            raise HTTPException(status_code=400, detail="No data fetched from Yahoo Finance")
 
         df = pd.concat(all_data, ignore_index=True)
 
@@ -767,8 +799,6 @@ PERIOD = "{config.period}"
 DUCKDB_PATH = '/opt/airflow/data/warehouse.duckdb'
 ICEBERG_DIR = '/opt/airflow/data/iceberg/stock_prices/data'
 
-USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-
 default_args = {{
     'owner': 'airflow',
     'depends_on_past': False,
@@ -779,28 +809,44 @@ default_args = {{
 
 def fetch_and_save_stock_data(**context):
     """Fetch stock data and save with Iceberg-style versioning."""
-    import time
-
-    session = requests.Session()
-    session.headers.update({{'User-Agent': USER_AGENT}})
-
+    # Use yf.download() - more reliable than Ticker().history()
+    # Note: yfinance >= 0.2.40 doesn't work with custom requests.Session
     all_data = []
 
-    for symbol in SYMBOLS:
-        try:
-            ticker = yf.Ticker(symbol, session=session)
-            hist = ticker.history(period=PERIOD)
+    try:
+        df = yf.download(
+            tickers=SYMBOLS,
+            period=PERIOD,
+            group_by='ticker',
+            auto_adjust=True,
+            progress=False,
+            threads=True
+        )
 
-            if not hist.empty:
-                hist = hist.reset_index()
-                hist['symbol'] = symbol
-                hist['fetch_timestamp'] = datetime.now().isoformat()
-                hist.columns = [c.lower().replace(' ', '_') for c in hist.columns]
-                all_data.append(hist)
-        except Exception as e:
-            print(f"Error fetching {{symbol}}: {{e}}")
-
-        time.sleep(0.5)
+        if not df.empty:
+            if len(SYMBOLS) == 1:
+                symbol = SYMBOLS[0]
+                df = df.reset_index()
+                df['symbol'] = symbol
+                df['fetch_timestamp'] = datetime.now().isoformat()
+                df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                all_data.append(df)
+            else:
+                for symbol in SYMBOLS:
+                    try:
+                        if symbol in df.columns.get_level_values(0):
+                            symbol_df = df[symbol].copy()
+                            symbol_df = symbol_df.reset_index()
+                            symbol_df['symbol'] = symbol
+                            symbol_df['fetch_timestamp'] = datetime.now().isoformat()
+                            symbol_df.columns = [c.lower().replace(' ', '_') for c in symbol_df.columns]
+                            symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
+                            if not symbol_df.empty:
+                                all_data.append(symbol_df)
+                    except Exception as e:
+                        print(f"Error processing {{symbol}}: {{e}}")
+    except Exception as e:
+        print(f"Download failed: {{e}}")
 
     if not all_data:
         raise ValueError("No data fetched from Yahoo Finance")
