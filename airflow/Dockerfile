@@ -7,5 +7,7 @@ RUN pip install --no-cache-dir \
     pandas==2.1.4 \
     requests==2.31.0 \
     pyarrow==15.0.0 \
-    yfinance==0.2.36 \
-    lxml==5.1.0
+    yfinance>=0.2.43 \
+    lxml==5.1.0 \
+    html5lib \
+    beautifulsoup4

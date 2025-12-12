@@ -22,7 +22,12 @@ DUCKDB_PATH = '/opt/airflow/data/warehouse.duckdb'  # Must match API path!
 CSV_PATH = '/opt/airflow/data/gleif_golden_copy.csv'
 ZIP_PATH = '/opt/airflow/data/gleif_golden_copy.zip'
 
-GOLDEN_COPY_URL = "https://goldencopy.gleif.org/api/v2/golden-copies/publishes/lei2/latest.csv"
+# GLEIF Golden Copy URLs - try multiple in case one fails
+GOLDEN_COPY_URLS = [
+    "https://leidata.gleif.org/api/v1/concatenated-files/lei2/get/30447/zip",
+    "https://goldencopy.gleif.org/api/v2/golden-copies/publishes/lei2/latest",
+    "https://leidata-preview.gleif.org/storage/golden-copy/2024/11/01/lei2/20241101-gleif-goldencopy-lei2-golden-copy.csv.zip",
+]
 
 # Chunking config - tune based on available memory
 CHUNK_SIZE = 100_000  # rows per chunk
@@ -44,20 +49,41 @@ def download_golden_copy(**context):
     """
     Download the GLEIF Golden Copy ZIP and extract CSV.
     Uses streaming to handle large file without loading into memory.
+    Tries multiple URLs in case one fails.
     """
-    print(f"[GLEIF] Starting download from: {GOLDEN_COPY_URL}")
     os.makedirs(DATA_DIR, exist_ok=True)
-    
+
     # Clean up any existing files
     for path in [ZIP_PATH, CSV_PATH]:
         if os.path.exists(path):
             os.remove(path)
             print(f"[GLEIF] Removed existing: {path}")
-    
-    # Download with streaming
+
+    # Try each URL until one works
     session = requests.Session()
-    response = session.get(GOLDEN_COPY_URL, stream=True, timeout=600, allow_redirects=True)
-    response.raise_for_status()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (compatible; OpenDataPlatform/1.0)',
+        'Accept': '*/*'
+    })
+
+    response = None
+    working_url = None
+
+    for url in GOLDEN_COPY_URLS:
+        print(f"[GLEIF] Trying URL: {url}")
+        try:
+            response = session.get(url, stream=True, timeout=600, allow_redirects=True)
+            if response.status_code == 200:
+                working_url = url
+                print(f"[GLEIF] Success! Using: {response.url}")
+                break
+            else:
+                print(f"[GLEIF] Failed with status {response.status_code}")
+        except Exception as e:
+            print(f"[GLEIF] Failed: {e}")
+
+    if not response or response.status_code != 200:
+        raise Exception(f"All GLEIF Golden Copy URLs failed. Tried: {GOLDEN_COPY_URLS}")
     
     print(f"[GLEIF] Downloading from: {response.url}")
     
