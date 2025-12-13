@@ -614,8 +614,8 @@ async def fetch_yahoo_finance_now(config: YahooFinanceConfig):
 
             # Flatten multi-index columns if present
             if isinstance(df.columns, pd.MultiIndex):
-                # For multi-index, take the second level (metric name)
-                df.columns = [col[1] if isinstance(col, tuple) else col for col in df.columns]
+                # Get the level that contains the metric names (Open, High, Low, Close, Volume)
+                df.columns = df.columns.get_level_values(-1)
 
             df = df.reset_index()
             df['symbol'] = symbol
@@ -710,19 +710,30 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
             if df.empty:
                 return None
 
+            print(f"[YF Process] Original columns type: {type(df.columns)}")
+            print(f"[YF Process] Original columns: {list(df.columns)}")
+
             # Flatten multi-index columns if present
             if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [col[1] if isinstance(col, tuple) else col for col in df.columns]
+                # Get the level that contains the metric names (Open, High, Low, Close, Volume)
+                # Usually it's the last level
+                df.columns = df.columns.get_level_values(-1)
+                print(f"[YF Process] Flattened columns: {list(df.columns)}")
 
             df = df.reset_index()
             df['symbol'] = symbol
             df['fetch_timestamp'] = datetime.now().isoformat()
+
+            print(f"[YF Process] After reset_index columns: {list(df.columns)}")
 
             # Standardize column names
             df.columns = [str(c).lower().replace(' ', '_') for c in df.columns]
 
             # Remove any duplicate columns
             df = df.loc[:, ~df.columns.duplicated()]
+
+            print(f"[YF Process] Final columns: {list(df.columns)}")
+            print(f"[YF Process] DataFrame shape: {df.shape}")
 
             return df
 
@@ -768,6 +779,10 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
 
         df = pd.concat(all_data, ignore_index=True)
 
+        # Log columns for debugging
+        print(f"[Yahoo Finance Save] DataFrame columns: {list(df.columns)}")
+        print(f"[Yahoo Finance Save] DataFrame shape: {df.shape}")
+
         # Save to Iceberg-style directory
         iceberg_dir = "/app/data/iceberg/stock_prices/data"
         os.makedirs(iceberg_dir, exist_ok=True)
@@ -778,7 +793,7 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
 
         df.to_parquet(parquet_path, engine='pyarrow', compression='snappy')
 
-        # Load to DuckDB
+        # Load to DuckDB with dynamic column handling
         conn = get_db_connection(read_only=False)
 
         conn.execute("""
@@ -788,20 +803,32 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
                 high DOUBLE,
                 low DOUBLE,
                 close DOUBLE,
-                volume BIGINT,
-                dividends DOUBLE,
-                stock_splits DOUBLE,
+                volume DOUBLE,
                 symbol VARCHAR,
                 fetch_timestamp VARCHAR,
                 ingestion_date DATE DEFAULT CURRENT_DATE
             )
         """)
 
+        # Get columns from parquet file
+        parquet_cols = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}') LIMIT 0").description
+        available_cols = [col[0] for col in parquet_cols]
+        print(f"[Yahoo Finance Save] Parquet columns: {available_cols}")
+
+        # Build dynamic INSERT based on available columns
+        target_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol', 'fetch_timestamp']
+        select_parts = []
+        for col in target_cols:
+            if col in available_cols:
+                select_parts.append(f'"{col}"')
+            else:
+                select_parts.append(f"NULL as {col}")
+
+        select_clause = ", ".join(select_parts)
+
         conn.execute(f"""
-            INSERT INTO stock_prices
-            SELECT
-                date, open, high, low, close, volume, dividends, stock_splits,
-                symbol, fetch_timestamp, CURRENT_DATE as ingestion_date
+            INSERT INTO stock_prices (date, open, high, low, close, volume, symbol, fetch_timestamp, ingestion_date)
+            SELECT {select_clause}, CURRENT_DATE as ingestion_date
             FROM read_parquet('{parquet_path}')
         """)
 
@@ -866,7 +893,7 @@ def fetch_and_save_stock_data(**context):
             return None
         # Flatten multi-index columns if present
         if hasattr(df.columns, 'nlevels') and df.columns.nlevels > 1:
-            df.columns = [col[1] if isinstance(col, tuple) else col for col in df.columns]
+            df.columns = df.columns.get_level_values(-1)
         df = df.reset_index()
         df['symbol'] = symbol
         df['fetch_timestamp'] = datetime.now().isoformat()
