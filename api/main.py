@@ -939,21 +939,28 @@ def fetch_and_save_stock_data(**context):
     df.to_parquet(parquet_path, engine='pyarrow', compression='snappy')
     print(f"Saved: {{parquet_path}}")
 
-    # Load to DuckDB
+    # Load to DuckDB with dynamic column handling
     conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stock_prices (
             date TIMESTAMP, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
-            volume BIGINT, dividends DOUBLE, stock_splits DOUBLE,
-            symbol VARCHAR, fetch_timestamp VARCHAR, ingestion_date DATE DEFAULT CURRENT_DATE
+            volume DOUBLE, symbol VARCHAR, fetch_timestamp VARCHAR,
+            ingestion_date DATE DEFAULT CURRENT_DATE
         )
     """)
 
+    # Get available columns from parquet
+    parquet_cols = conn.execute(f"SELECT * FROM read_parquet('{{parquet_path}}') LIMIT 0").description
+    available = [col[0] for col in parquet_cols]
+
+    # Build dynamic SELECT
+    target = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol', 'fetch_timestamp']
+    parts = [f'"{c}"' if c in available else f'NULL as {c}' for c in target]
+
     conn.execute(f"""
-        INSERT INTO stock_prices
-        SELECT date, open, high, low, close, volume, dividends, stock_splits,
-               symbol, fetch_timestamp, CURRENT_DATE
+        INSERT INTO stock_prices (date, open, high, low, close, volume, symbol, fetch_timestamp, ingestion_date)
+        SELECT {{', '.join(parts)}}, CURRENT_DATE
         FROM read_parquet('{{parquet_path}}')
     """)
 
