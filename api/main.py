@@ -796,6 +796,7 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
         # Load to DuckDB with dynamic column handling
         conn = get_db_connection(read_only=False)
 
+        # Create table if not exists
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_prices (
                 date TIMESTAMP,
@@ -805,30 +806,49 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
                 close DOUBLE,
                 volume DOUBLE,
                 symbol VARCHAR,
-                fetch_timestamp VARCHAR,
                 ingestion_date DATE DEFAULT CURRENT_DATE
             )
         """)
+
+        # Add fetch_timestamp column if it doesn't exist
+        try:
+            conn.execute("ALTER TABLE stock_prices ADD COLUMN fetch_timestamp VARCHAR")
+        except:
+            pass  # Column already exists
 
         # Get columns from parquet file
         parquet_cols = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}') LIMIT 0").description
         available_cols = [col[0] for col in parquet_cols]
         print(f"[Yahoo Finance Save] Parquet columns: {available_cols}")
 
-        # Build dynamic INSERT based on available columns
-        target_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol', 'fetch_timestamp']
-        select_parts = []
-        for col in target_cols:
-            if col in available_cols:
-                select_parts.append(f'"{col}"')
-            else:
-                select_parts.append(f"NULL as {col}")
+        # Get columns from table
+        table_cols = conn.execute("SELECT * FROM stock_prices LIMIT 0").description
+        table_col_names = [col[0] for col in table_cols]
+        print(f"[Yahoo Finance Save] Table columns: {table_col_names}")
 
+        # Build dynamic INSERT - only insert into columns that exist in BOTH parquet and table
+        base_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']
+        insert_cols = []
+        select_parts = []
+
+        for col in base_cols:
+            if col in table_col_names:
+                insert_cols.append(col)
+                if col in available_cols:
+                    select_parts.append(f'"{col}"')
+                else:
+                    select_parts.append(f"NULL")
+
+        # Add ingestion_date
+        insert_cols.append('ingestion_date')
+        select_parts.append('CURRENT_DATE')
+
+        insert_clause = ", ".join(insert_cols)
         select_clause = ", ".join(select_parts)
 
         conn.execute(f"""
-            INSERT INTO stock_prices (date, open, high, low, close, volume, symbol, fetch_timestamp, ingestion_date)
-            SELECT {select_clause}, CURRENT_DATE as ingestion_date
+            INSERT INTO stock_prices ({insert_clause})
+            SELECT {select_clause}
             FROM read_parquet('{parquet_path}')
         """)
 
