@@ -607,16 +607,31 @@ async def fetch_yahoo_finance_now(config: YahooFinanceConfig):
         all_data = []
         errors = []
 
-        def safe_column_name(col):
-            """Convert column name to lowercase string, handling tuples from multi-index"""
-            if isinstance(col, tuple):
-                return str(col[-1]).lower().replace(' ', '_')
-            return str(col).lower().replace(' ', '_')
+        def process_yf_dataframe(df, symbol):
+            """Process yfinance DataFrame, handling multi-index columns"""
+            if df.empty:
+                return None
+
+            # Flatten multi-index columns if present
+            if isinstance(df.columns, pd.MultiIndex):
+                # For multi-index, take the second level (metric name)
+                df.columns = [col[1] if isinstance(col, tuple) else col for col in df.columns]
+
+            df = df.reset_index()
+            df['symbol'] = symbol
+
+            # Standardize column names
+            df.columns = [str(c).lower().replace(' ', '_') for c in df.columns]
+
+            # Remove any duplicate columns by keeping first occurrence
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            return df
 
         # Try bulk download first (faster and more reliable)
         try:
             if len(config.symbols) == 1:
-                # Single symbol - don't use group_by to avoid multi-index issues
+                # Single symbol
                 symbol = config.symbols[0]
                 df = yf.download(
                     tickers=symbol,
@@ -624,11 +639,9 @@ async def fetch_yahoo_finance_now(config: YahooFinanceConfig):
                     auto_adjust=True,
                     progress=False
                 )
-                if not df.empty:
-                    df = df.reset_index()
-                    df['symbol'] = symbol
-                    df.columns = [safe_column_name(c) for c in df.columns]
-                    all_data.append(df)
+                processed = process_yf_dataframe(df, symbol)
+                if processed is not None and not processed.empty:
+                    all_data.append(processed)
                 else:
                     errors.append(f"No data for {symbol}")
             else:
@@ -647,14 +660,13 @@ async def fetch_yahoo_finance_now(config: YahooFinanceConfig):
                         try:
                             if symbol in df.columns.get_level_values(0):
                                 symbol_df = df[symbol].copy()
-                                symbol_df = symbol_df.reset_index()
-                                symbol_df['symbol'] = symbol
-                                symbol_df.columns = [safe_column_name(c) for c in symbol_df.columns]
-                                symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
-                                if not symbol_df.empty:
-                                    all_data.append(symbol_df)
-                                else:
-                                    errors.append(f"No data for {symbol}")
+                                processed = process_yf_dataframe(symbol_df, symbol)
+                                if processed is not None:
+                                    processed = processed.dropna(subset=['open', 'high', 'low', 'close'], how='all')
+                                    if not processed.empty:
+                                        all_data.append(processed)
+                                    else:
+                                        errors.append(f"No data for {symbol}")
                         except Exception as e:
                             errors.append(f"Error processing {symbol}: {str(e)}")
         except Exception as e:
@@ -693,15 +705,29 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
         # Note: yfinance >= 0.2.40 doesn't work with custom requests.Session
         all_data = []
 
-        def safe_column_name(col):
-            """Convert column name to lowercase string, handling tuples from multi-index"""
-            if isinstance(col, tuple):
-                return str(col[-1]).lower().replace(' ', '_')
-            return str(col).lower().replace(' ', '_')
+        def process_yf_dataframe(df, symbol):
+            """Process yfinance DataFrame, handling multi-index columns"""
+            if df.empty:
+                return None
+
+            # Flatten multi-index columns if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[1] if isinstance(col, tuple) else col for col in df.columns]
+
+            df = df.reset_index()
+            df['symbol'] = symbol
+            df['fetch_timestamp'] = datetime.now().isoformat()
+
+            # Standardize column names
+            df.columns = [str(c).lower().replace(' ', '_') for c in df.columns]
+
+            # Remove any duplicate columns
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            return df
 
         try:
             if len(config.symbols) == 1:
-                # Single symbol - don't use group_by to avoid multi-index issues
                 symbol = config.symbols[0]
                 df = yf.download(
                     tickers=symbol,
@@ -709,14 +735,10 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
                     auto_adjust=True,
                     progress=False
                 )
-                if not df.empty:
-                    df = df.reset_index()
-                    df['symbol'] = symbol
-                    df['fetch_timestamp'] = datetime.now().isoformat()
-                    df.columns = [safe_column_name(c) for c in df.columns]
-                    all_data.append(df)
+                processed = process_yf_dataframe(df, symbol)
+                if processed is not None and not processed.empty:
+                    all_data.append(processed)
             else:
-                # Multiple symbols - use group_by='ticker'
                 df = yf.download(
                     tickers=config.symbols,
                     period=config.period,
@@ -731,13 +753,11 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
                         try:
                             if symbol in df.columns.get_level_values(0):
                                 symbol_df = df[symbol].copy()
-                                symbol_df = symbol_df.reset_index()
-                                symbol_df['symbol'] = symbol
-                                symbol_df['fetch_timestamp'] = datetime.now().isoformat()
-                                symbol_df.columns = [safe_column_name(c) for c in symbol_df.columns]
-                                symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
-                                if not symbol_df.empty:
-                                    all_data.append(symbol_df)
+                                processed = process_yf_dataframe(symbol_df, symbol)
+                                if processed is not None:
+                                    processed = processed.dropna(subset=['open', 'high', 'low', 'close'], how='all')
+                                    if not processed.empty:
+                                        all_data.append(processed)
                         except:
                             continue
         except:
@@ -839,46 +859,40 @@ default_args = {{
 
 def fetch_and_save_stock_data(**context):
     """Fetch stock data and save with Iceberg-style versioning."""
-    # Use yf.download() - more reliable than Ticker().history()
-    # Note: yfinance >= 0.2.40 doesn't work with custom requests.Session
     all_data = []
 
-    def safe_col(col):
-        if isinstance(col, tuple):
-            return str(col[-1]).lower().replace(' ', '_')
-        return str(col).lower().replace(' ', '_')
+    def process_df(df, symbol):
+        if df.empty:
+            return None
+        # Flatten multi-index columns if present
+        if hasattr(df.columns, 'nlevels') and df.columns.nlevels > 1:
+            df.columns = [col[1] if isinstance(col, tuple) else col for col in df.columns]
+        df = df.reset_index()
+        df['symbol'] = symbol
+        df['fetch_timestamp'] = datetime.now().isoformat()
+        df.columns = [str(c).lower().replace(' ', '_') for c in df.columns]
+        df = df.loc[:, ~df.columns.duplicated()]
+        return df
 
     try:
         if len(SYMBOLS) == 1:
             symbol = SYMBOLS[0]
             df = yf.download(tickers=symbol, period=PERIOD, auto_adjust=True, progress=False)
-            if not df.empty:
-                df = df.reset_index()
-                df['symbol'] = symbol
-                df['fetch_timestamp'] = datetime.now().isoformat()
-                df.columns = [safe_col(c) for c in df.columns]
-                all_data.append(df)
+            processed = process_df(df, symbol)
+            if processed is not None and not processed.empty:
+                all_data.append(processed)
         else:
-            df = yf.download(
-                tickers=SYMBOLS,
-                period=PERIOD,
-                group_by='ticker',
-                auto_adjust=True,
-                progress=False,
-                threads=True
-            )
+            df = yf.download(tickers=SYMBOLS, period=PERIOD, group_by='ticker', auto_adjust=True, progress=False, threads=True)
             if not df.empty:
                 for symbol in SYMBOLS:
                     try:
                         if symbol in df.columns.get_level_values(0):
                             symbol_df = df[symbol].copy()
-                            symbol_df = symbol_df.reset_index()
-                            symbol_df['symbol'] = symbol
-                            symbol_df['fetch_timestamp'] = datetime.now().isoformat()
-                            symbol_df.columns = [safe_col(c) for c in symbol_df.columns]
-                            symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
-                            if not symbol_df.empty:
-                                all_data.append(symbol_df)
+                            processed = process_df(symbol_df, symbol)
+                            if processed is not None:
+                                processed = processed.dropna(subset=['open', 'high', 'low', 'close'], how='all')
+                                if not processed.empty:
+                                    all_data.append(processed)
                     except Exception as e:
                         print(f"Error processing {{symbol}}: {{e}}")
     except Exception as e:
