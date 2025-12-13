@@ -783,87 +783,76 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
         print(f"[Yahoo Finance Save] DataFrame columns: {list(df.columns)}")
         print(f"[Yahoo Finance Save] DataFrame shape: {df.shape}")
 
-        # Save to Iceberg-style directory
-        iceberg_dir = "/app/data/iceberg/stock_prices/data"
-        os.makedirs(iceberg_dir, exist_ok=True)
+        # Save to Delta Lake with ACID transactions
+        from deltalake import write_deltalake, DeltaTable
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        snapshot_id = int(datetime.now().timestamp() * 1000)
-        parquet_path = f"{iceberg_dir}/snapshot_{snapshot_id}_{timestamp}.parquet"
+        delta_path = "/app/data/delta/stock_prices"
+        os.makedirs(os.path.dirname(delta_path), exist_ok=True)
 
-        df.to_parquet(parquet_path, engine='pyarrow', compression='snappy')
+        # Add metadata columns
+        df['ingestion_date'] = datetime.now().date()
+        df['ingestion_timestamp'] = datetime.now().isoformat()
 
-        # Load to DuckDB with dynamic column handling
+        # Ensure date column is datetime
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+
+        # Write to Delta Lake
+        try:
+            delta_log_path = os.path.join(delta_path, '_delta_log')
+            if os.path.exists(delta_path) and os.path.exists(delta_log_path):
+                print("[Delta Lake] Appending to existing table...")
+                write_deltalake(
+                    delta_path,
+                    df,
+                    mode="append",
+                    schema_mode="merge"
+                )
+            else:
+                print("[Delta Lake] Creating new Delta table...")
+                write_deltalake(
+                    delta_path,
+                    df,
+                    mode="overwrite",
+                    partition_by=["symbol"]
+                )
+
+            # Get Delta table info
+            dt = DeltaTable(delta_path)
+            version = dt.version()
+
+            print(f"[Delta Lake] Saved successfully. Version: {version}")
+
+        except Exception as e:
+            print(f"[Delta Lake] Error: {e}")
+            raise HTTPException(status_code=500, detail=f"Delta Lake error: {str(e)}")
+
+        # Sync to DuckDB for querying
         conn = get_db_connection(read_only=False)
 
-        # Create table if not exists
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS stock_prices (
-                date TIMESTAMP,
-                open DOUBLE,
-                high DOUBLE,
-                low DOUBLE,
-                close DOUBLE,
-                volume DOUBLE,
-                symbol VARCHAR,
-                ingestion_date DATE DEFAULT CURRENT_DATE
-            )
-        """)
-
-        # Add fetch_timestamp column if it doesn't exist
         try:
-            conn.execute("ALTER TABLE stock_prices ADD COLUMN fetch_timestamp VARCHAR")
-        except:
-            pass  # Column already exists
-
-        # Get columns from parquet file
-        parquet_cols = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}') LIMIT 0").description
-        available_cols = [col[0] for col in parquet_cols]
-        print(f"[Yahoo Finance Save] Parquet columns: {available_cols}")
-
-        # Get columns from table
-        table_cols = conn.execute("SELECT * FROM stock_prices LIMIT 0").description
-        table_col_names = [col[0] for col in table_cols]
-        print(f"[Yahoo Finance Save] Table columns: {table_col_names}")
-
-        # Build dynamic INSERT - only insert into columns that exist in BOTH parquet and table
-        base_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']
-        insert_cols = []
-        select_parts = []
-
-        for col in base_cols:
-            if col in table_col_names:
-                insert_cols.append(col)
-                if col in available_cols:
-                    select_parts.append(f'"{col}"')
-                else:
-                    select_parts.append(f"NULL")
-
-        # Add ingestion_date only if it exists in the table
-        if 'ingestion_date' in table_col_names:
-            insert_cols.append('ingestion_date')
-            select_parts.append('CURRENT_DATE')
-
-        # Add fetch_timestamp if it exists in both parquet and table
-        if 'fetch_timestamp' in table_col_names and 'fetch_timestamp' in available_cols:
-            insert_cols.append('fetch_timestamp')
-            select_parts.append('"fetch_timestamp"')
-
-        insert_clause = ", ".join(insert_cols)
-        select_clause = ", ".join(select_parts)
-
-        conn.execute(f"""
-            INSERT INTO stock_prices ({insert_clause})
-            SELECT {select_clause}
-            FROM read_parquet('{parquet_path}')
-        """)
+            # Try using delta extension
+            conn.execute("INSTALL delta;")
+            conn.execute("LOAD delta;")
+            conn.execute(f"""
+                CREATE OR REPLACE TABLE stock_prices AS
+                SELECT * FROM delta_scan('{delta_path}')
+            """)
+        except Exception as e:
+            print(f"[DuckDB] Delta extension failed, using parquet fallback: {e}")
+            # Fallback to reading parquet files directly
+            conn.execute(f"""
+                CREATE OR REPLACE TABLE stock_prices AS
+                SELECT * FROM read_parquet('{delta_path}/*.parquet')
+            """)
 
         count = conn.execute("SELECT COUNT(*) FROM stock_prices").fetchone()[0]
         conn.close()
 
         return {
-            "message": "Data saved successfully",
-            "parquet_path": parquet_path,
+            "message": "Data saved successfully with Delta Lake ACID transaction",
+            "delta_path": delta_path,
+            "delta_version": version,
             "records_saved": len(df),
             "total_records": count
         }
@@ -1320,92 +1309,263 @@ async def get_cron_examples():
         ]
     }
 
-# ============== Iceberg/Versioning Endpoints ==============
+# ============== Delta Lake Endpoints ==============
 
-@app.get("/iceberg/snapshots")
-async def list_iceberg_snapshots(table_name: str = "stock_prices"):
-    """List all Iceberg-style snapshots for a table."""
+@app.get("/delta/tables")
+async def list_delta_tables():
+    """List all Delta Lake tables."""
     try:
-        iceberg_dir = f"/app/data/iceberg/{table_name}/data"
+        delta_base = "/app/data/delta"
+        tables = []
 
-        if not os.path.exists(iceberg_dir):
-            return {"snapshots": [], "message": f"No snapshots found for {table_name}"}
+        if os.path.exists(delta_base):
+            for item in os.listdir(delta_base):
+                table_path = os.path.join(delta_base, item)
+                delta_log = os.path.join(table_path, '_delta_log')
 
-        snapshots = []
-        for f in os.listdir(iceberg_dir):
-            if f.endswith('.parquet'):
-                file_path = os.path.join(iceberg_dir, f)
-                stat = os.stat(file_path)
+                if os.path.isdir(table_path) and os.path.exists(delta_log):
+                    try:
+                        from deltalake import DeltaTable
+                        dt = DeltaTable(table_path)
+                        tables.append({
+                            "name": item,
+                            "path": table_path,
+                            "version": dt.version(),
+                            "files": len(dt.files())
+                        })
+                    except:
+                        tables.append({
+                            "name": item,
+                            "path": table_path,
+                            "version": "unknown",
+                            "files": 0
+                        })
 
-                # Parse snapshot info from filename
-                # Format: snapshot_{id}_{timestamp}.parquet
-                parts = f.replace('.parquet', '').split('_')
-                snapshot_id = parts[1] if len(parts) >= 2 else None
-
-                snapshots.append({
-                    "filename": f,
-                    "snapshot_id": snapshot_id,
-                    "size_bytes": stat.st_size,
-                    "size_kb": round(stat.st_size / 1024, 2),
-                    "created": datetime.fromtimestamp(stat.st_ctime).isoformat(),
-                    "path": file_path
-                })
-
-        # Sort by creation time (newest first)
-        snapshots.sort(key=lambda x: x['created'], reverse=True)
-
-        return {
-            "table": table_name,
-            "snapshot_count": len(snapshots),
-            "snapshots": snapshots
-        }
+        return {"tables": tables}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/iceberg/query")
-async def query_iceberg_snapshot(
-    table_name: str = "stock_prices",
-    snapshot_id: Optional[str] = None,
-    limit: int = 100
-):
+
+@app.get("/delta/{table_name}/history")
+async def get_delta_history(table_name: str, limit: int = 20):
     """
-    Query Iceberg-style data. Optionally specify a snapshot for time-travel.
+    Get version history for a Delta Lake table.
+    Shows all commits with timestamps and operations.
     """
     try:
-        iceberg_dir = f"/app/data/iceberg/{table_name}/data"
+        from deltalake import DeltaTable
 
-        if not os.path.exists(iceberg_dir):
+        delta_path = f"/app/data/delta/{table_name}"
+
+        if not os.path.exists(delta_path):
             raise HTTPException(status_code=404, detail=f"Table {table_name} not found")
 
-        conn = get_db_connection()
-
-        if snapshot_id:
-            # Query specific snapshot
-            parquet_files = [f for f in os.listdir(iceberg_dir) if snapshot_id in f]
-            if not parquet_files:
-                raise HTTPException(status_code=404, detail=f"Snapshot {snapshot_id} not found")
-
-            file_path = os.path.join(iceberg_dir, parquet_files[0])
-            query = f"SELECT * FROM read_parquet('{file_path}') LIMIT {limit}"
-        else:
-            # Query all snapshots (current state)
-            query = f"SELECT * FROM read_parquet('{iceberg_dir}/*.parquet') LIMIT {limit}"
-
-        df = conn.execute(query).fetchdf()
-        conn.close()
+        dt = DeltaTable(delta_path)
+        history = dt.history(limit=limit)
 
         return {
-            "data": df.to_dict('records'),
-            "columns": list(df.columns),
-            "row_count": len(df),
-            "snapshot_id": snapshot_id or "all"
+            "table": table_name,
+            "current_version": dt.version(),
+            "history": history
         }
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/delta/{table_name}/query")
+async def query_delta_table(
+    table_name: str,
+    version: Optional[int] = None,
+    timestamp: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    Query a Delta Lake table with optional time travel.
+
+    Time travel options:
+    - version: Query specific version number (e.g., version=5)
+    - timestamp: Query as of timestamp (e.g., timestamp=2024-01-15T10:00:00)
+
+    Examples:
+    - /delta/stock_prices/query - Current data
+    - /delta/stock_prices/query?version=3 - Data at version 3
+    - /delta/stock_prices/query?timestamp=2024-01-15 - Data as of date
+    """
+    try:
+        from deltalake import DeltaTable
+
+        delta_path = f"/app/data/delta/{table_name}"
+
+        if not os.path.exists(delta_path):
+            raise HTTPException(status_code=404, detail=f"Table {table_name} not found")
+
+        # Load table with time travel if specified
+        if version is not None:
+            dt = DeltaTable(delta_path, version=version)
+            time_travel_info = f"version {version}"
+        elif timestamp:
+            dt = DeltaTable(delta_path, timestamp=timestamp)
+            time_travel_info = f"timestamp {timestamp}"
+        else:
+            dt = DeltaTable(delta_path)
+            time_travel_info = "current"
+
+        # Convert to pandas for query
+        df = dt.to_pandas()
+
+        # Apply limit
+        if limit and limit < len(df):
+            df = df.head(limit)
+
+        return {
+            "table": table_name,
+            "version": dt.version(),
+            "time_travel": time_travel_info,
+            "columns": list(df.columns),
+            "row_count": len(df),
+            "data": df.to_dict('records')
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/delta/{table_name}/restore")
+async def restore_delta_version(table_name: str, target_version: int):
+    """
+    Restore a Delta Lake table to a previous version.
+    This creates a new version that matches the target version's data.
+    """
+    try:
+        from deltalake import DeltaTable
+
+        delta_path = f"/app/data/delta/{table_name}"
+
+        if not os.path.exists(delta_path):
+            raise HTTPException(status_code=404, detail=f"Table {table_name} not found")
+
+        dt = DeltaTable(delta_path)
+        current_version = dt.version()
+
+        if target_version > current_version:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Target version {target_version} is greater than current version {current_version}"
+            )
+
+        # Restore to target version
+        dt.restore(target_version)
+
+        new_version = dt.version()
+
+        return {
+            "message": f"Successfully restored {table_name} to version {target_version}",
+            "previous_version": current_version,
+            "restored_to": target_version,
+            "new_version": new_version
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/delta/{table_name}/optimize")
+async def optimize_delta_table(table_name: str):
+    """
+    Optimize a Delta Lake table by compacting small files.
+    Improves query performance.
+    """
+    try:
+        from deltalake import DeltaTable
+
+        delta_path = f"/app/data/delta/{table_name}"
+
+        if not os.path.exists(delta_path):
+            raise HTTPException(status_code=404, detail=f"Table {table_name} not found")
+
+        dt = DeltaTable(delta_path)
+        files_before = len(dt.files())
+
+        # Run compaction
+        result = dt.optimize.compact()
+
+        files_after = len(dt.files())
+
+        return {
+            "message": f"Optimization complete for {table_name}",
+            "files_before": files_before,
+            "files_after": files_after,
+            "version": dt.version(),
+            "metrics": result
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/delta/{table_name}/vacuum")
+async def vacuum_delta_table(table_name: str, retention_hours: int = 168):
+    """
+    Remove old files no longer referenced by the table.
+    Default retention is 7 days (168 hours).
+
+    WARNING: This permanently deletes old data files.
+    """
+    try:
+        from deltalake import DeltaTable
+
+        delta_path = f"/app/data/delta/{table_name}"
+
+        if not os.path.exists(delta_path):
+            raise HTTPException(status_code=404, detail=f"Table {table_name} not found")
+
+        dt = DeltaTable(delta_path)
+
+        # Vacuum with retention
+        deleted_files = dt.vacuum(
+            retention_hours=retention_hours,
+            enforce_retention_duration=False,
+            dry_run=False
+        )
+
+        return {
+            "message": f"Vacuum complete for {table_name}",
+            "retention_hours": retention_hours,
+            "deleted_files": deleted_files
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Legacy Iceberg endpoints (redirect to Delta)
+@app.get("/iceberg/snapshots")
+async def list_iceberg_snapshots_legacy(table_name: str = "stock_prices"):
+    """Legacy endpoint - redirects to Delta Lake history."""
+    return await get_delta_history(table_name)
+
+
+@app.get("/iceberg/query")
+async def query_iceberg_snapshot_legacy(
+    table_name: str = "stock_prices",
+    snapshot_id: Optional[str] = None,
+    limit: int = 100
+):
+    """Legacy endpoint - redirects to Delta Lake query."""
+    version = int(snapshot_id) if snapshot_id and snapshot_id.isdigit() else None
+    return await query_delta_table(table_name, version=version, limit=limit)
 
 # ============== DBT Templates ==============
 

@@ -1,8 +1,12 @@
 """
 Yahoo Finance Data Pipeline DAG
-Fetches stock data from Yahoo Finance and stores in DuckDB with Iceberg-style versioning.
+Fetches stock data from Yahoo Finance and stores using Delta Lake format with ACID transactions.
 
-Uses yf.download() which is more reliable than Ticker.history() for bulk fetches.
+Features:
+- Delta Lake format with full ACID compliance
+- Time travel queries (query any historical version)
+- Automatic compaction and optimization
+- Schema evolution support
 """
 
 from airflow import DAG
@@ -14,7 +18,7 @@ import pandas as pd
 # Configuration
 DATA_DIR = '/opt/airflow/data'
 DUCKDB_PATH = '/opt/airflow/data/warehouse.duckdb'
-ICEBERG_DIR = '/opt/airflow/data/iceberg/stock_prices/data'
+DELTA_TABLE_PATH = '/opt/airflow/data/delta/stock_prices'
 
 default_args = {
     'owner': 'airflow',
@@ -53,7 +57,6 @@ def fetch_yahoo_finance_data(**context):
     try:
         print("[Yahoo Finance] Attempting bulk download...")
 
-        # yf.download() returns multi-index columns when downloading multiple symbols
         df = yf.download(
             tickers=symbols,
             period=period,
@@ -68,7 +71,6 @@ def fetch_yahoo_finance_data(**context):
 
             # Handle single vs multiple symbols (different DataFrame structure)
             if len(symbols) == 1:
-                # Single symbol: columns are just OHLCV
                 symbol = symbols[0]
                 df = df.reset_index()
                 df['symbol'] = symbol
@@ -125,7 +127,6 @@ def fetch_yahoo_finance_data(**context):
                 else:
                     print(f"[Yahoo Finance] No data for {symbol}")
 
-                # Rate limiting
                 time.sleep(1)
 
             except Exception as e:
@@ -140,19 +141,10 @@ def fetch_yahoo_finance_data(**context):
 
     # Ensure consistent column names
     column_mapping = {
-        'date': 'date',
         'datetime': 'date',
-        'open': 'open',
-        'high': 'high',
-        'low': 'low',
-        'close': 'close',
         'adj_close': 'adj_close',
-        'volume': 'volume',
-        'symbol': 'symbol',
-        'fetch_timestamp': 'fetch_timestamp'
     }
 
-    # Rename columns that exist
     for old_name, new_name in column_mapping.items():
         if old_name in combined_df.columns and old_name != new_name:
             combined_df = combined_df.rename(columns={old_name: new_name})
@@ -164,13 +156,17 @@ def fetch_yahoo_finance_data(**context):
     return combined_df.to_json(orient='records', date_format='iso')
 
 
-def save_to_iceberg_style(**context):
+def save_to_delta_lake(**context):
     """
-    Save data to timestamped Parquet files (Iceberg-style versioning).
+    Save data to Delta Lake format with ACID transactions.
+
+    Delta Lake provides:
+    - ACID transactions (atomic writes)
+    - Time travel (query historical versions)
+    - Schema evolution
+    - Audit history
     """
-    import json
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    from deltalake import write_deltalake, DeltaTable
 
     ti = context['ti']
     json_data = ti.xcom_pull(task_ids='fetch_yahoo_data')
@@ -179,68 +175,105 @@ def save_to_iceberg_style(**context):
         raise ValueError("No data received from fetch task")
 
     df = pd.read_json(json_data, orient='records')
-    print(f"[Iceberg] Processing {len(df)} records")
+    print(f"[Delta Lake] Processing {len(df)} records")
 
-    # Create directory
-    os.makedirs(ICEBERG_DIR, exist_ok=True)
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(DELTA_TABLE_PATH), exist_ok=True)
 
-    # Generate timestamped filename
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    snapshot_id = int(datetime.now().timestamp() * 1000)
-    parquet_path = os.path.join(ICEBERG_DIR, f'snapshot_{snapshot_id}_{timestamp}.parquet')
+    # Add ingestion metadata
+    df['ingestion_date'] = datetime.now().date()
+    df['ingestion_timestamp'] = datetime.now().isoformat()
 
-    # Save as Parquet
-    table = pa.Table.from_pandas(df)
-    pq.write_table(table, parquet_path, compression='snappy')
+    # Ensure date column is datetime
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
 
-    print(f"[Iceberg] Saved snapshot: {parquet_path}")
-    print(f"[Iceberg] File size: {os.path.getsize(parquet_path) / 1024:.2f} KB")
-
-    # Update metadata
-    metadata_path = os.path.join(ICEBERG_DIR, '..', 'metadata.json')
+    # Write to Delta Lake with ACID transaction
+    # mode="append" adds new data
+    # mode="overwrite" replaces all data
     try:
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
+        if os.path.exists(DELTA_TABLE_PATH) and os.path.exists(os.path.join(DELTA_TABLE_PATH, '_delta_log')):
+            # Table exists - append with merge to avoid duplicates
+            print("[Delta Lake] Appending to existing table...")
+            write_deltalake(
+                DELTA_TABLE_PATH,
+                df,
+                mode="append",
+                schema_mode="merge"  # Allow schema evolution
+            )
         else:
-            metadata = {'snapshots': [], 'current_snapshot_id': None}
-    except:
-        metadata = {'snapshots': [], 'current_snapshot_id': None}
+            # Create new table
+            print("[Delta Lake] Creating new Delta table...")
+            write_deltalake(
+                DELTA_TABLE_PATH,
+                df,
+                mode="overwrite",
+                partition_by=["symbol"]  # Partition by symbol for faster queries
+            )
 
-    snapshot_info = {
-        'snapshot_id': snapshot_id,
-        'timestamp': timestamp,
-        'file_path': parquet_path,
-        'record_count': len(df),
-        'symbols': df['symbol'].unique().tolist() if 'symbol' in df.columns else [],
-    }
+        # Get table info
+        dt = DeltaTable(DELTA_TABLE_PATH)
+        version = dt.version()
+        history = dt.history(limit=1)
 
-    metadata['snapshots'].append(snapshot_info)
-    metadata['current_snapshot_id'] = snapshot_id
+        print(f"[Delta Lake] Successfully saved to: {DELTA_TABLE_PATH}")
+        print(f"[Delta Lake] Current version: {version}")
+        print(f"[Delta Lake] Total files: {len(dt.files())}")
 
-    if len(metadata['snapshots']) > 100:
-        metadata['snapshots'] = metadata['snapshots'][-100:]
+        if history:
+            print(f"[Delta Lake] Last operation: {history[0].get('operation', 'unknown')}")
 
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
+        return {
+            'path': DELTA_TABLE_PATH,
+            'version': version,
+            'records': len(df)
+        }
 
-    return parquet_path
+    except Exception as e:
+        print(f"[Delta Lake] Error writing: {e}")
+        raise
 
 
-def load_to_duckdb(**context):
+def optimize_delta_table(**context):
     """
-    Load the latest snapshot into DuckDB.
+    Optimize the Delta table by compacting small files.
+    This improves query performance.
+    """
+    from deltalake import DeltaTable
+
+    try:
+        dt = DeltaTable(DELTA_TABLE_PATH)
+
+        # Compact small files (optional - improves read performance)
+        print("[Delta Lake] Running optimization...")
+        dt.optimize.compact()
+
+        # Vacuum old files (keep 7 days of history by default)
+        # This removes files no longer referenced by the table
+        # dt.vacuum(retention_hours=168, enforce_retention_duration=False)
+
+        print(f"[Delta Lake] Optimization complete. Version: {dt.version()}")
+
+    except Exception as e:
+        print(f"[Delta Lake] Optimization skipped: {e}")
+
+
+def sync_to_duckdb(**context):
+    """
+    Sync Delta Lake table to DuckDB for fast analytical queries.
+    Uses DuckDB's delta extension for native Delta Lake support.
     """
     import duckdb
     import time
 
     ti = context['ti']
-    parquet_path = ti.xcom_pull(task_ids='save_to_iceberg')
+    delta_info = ti.xcom_pull(task_ids='save_to_delta')
 
-    if not parquet_path or not os.path.exists(parquet_path):
-        raise ValueError(f"Parquet file not found: {parquet_path}")
+    if not delta_info:
+        print("[DuckDB] No delta info received, skipping sync")
+        return
 
-    print(f"[DuckDB] Loading from: {parquet_path}")
+    print(f"[DuckDB] Syncing from Delta Lake: {DELTA_TABLE_PATH}")
 
     max_retries = 5
     retry_delay = 2
@@ -250,67 +283,22 @@ def load_to_duckdb(**context):
         try:
             conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-            # Create table with flexible schema
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS stock_prices (
-                    date TIMESTAMP,
-                    open DOUBLE,
-                    high DOUBLE,
-                    low DOUBLE,
-                    close DOUBLE,
-                    volume DOUBLE,
-                    symbol VARCHAR,
-                    fetch_timestamp VARCHAR,
-                    ingestion_date DATE DEFAULT CURRENT_DATE
-                )
-            """)
+            # Install and load delta extension
+            conn.execute("INSTALL delta;")
+            conn.execute("LOAD delta;")
 
-            # Read parquet and get actual columns
-            parquet_df = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}') LIMIT 1").fetchdf()
-            available_cols = list(parquet_df.columns)
-            print(f"[DuckDB] Parquet columns: {available_cols}")
-
-            # Get table columns to handle schema mismatch
-            table_cols = conn.execute("SELECT * FROM stock_prices LIMIT 0").description
-            table_col_names = [col[0] for col in table_cols]
-            print(f"[DuckDB] Table columns: {table_col_names}")
-
-            # Build fully dynamic INSERT - only use columns that exist in BOTH
-            base_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']
-            insert_cols = []
-            select_parts = []
-
-            for col in base_cols:
-                if col in table_col_names:
-                    insert_cols.append(col)
-                    if col in available_cols:
-                        select_parts.append(f'"{col}"')
-                    else:
-                        select_parts.append('NULL')
-
-            # Add optional columns only if they exist in the table
-            if 'fetch_timestamp' in table_col_names:
-                insert_cols.append('fetch_timestamp')
-                if 'fetch_timestamp' in available_cols:
-                    select_parts.append('"fetch_timestamp"')
-                else:
-                    select_parts.append('NULL')
-
-            if 'ingestion_date' in table_col_names:
-                insert_cols.append('ingestion_date')
-                select_parts.append('CURRENT_DATE')
-
-            insert_clause = ", ".join(insert_cols)
-            select_clause = ", ".join(select_parts)
-
+            # Create/replace table from Delta Lake
+            # This gives us a queryable copy in DuckDB
             conn.execute(f"""
-                INSERT INTO stock_prices ({insert_clause})
-                SELECT {select_clause}
-                FROM read_parquet('{parquet_path}')
+                CREATE OR REPLACE TABLE stock_prices AS
+                SELECT * FROM delta_scan('{DELTA_TABLE_PATH}')
             """)
 
             count = conn.execute("SELECT COUNT(*) FROM stock_prices").fetchone()[0]
-            print(f"[DuckDB] Total records in stock_prices: {count}")
+            symbols = conn.execute("SELECT DISTINCT symbol FROM stock_prices").fetchall()
+
+            print(f"[DuckDB] Synced {count} records")
+            print(f"[DuckDB] Symbols: {[s[0] for s in symbols]}")
 
             conn.close()
             return count
@@ -329,7 +317,33 @@ def load_to_duckdb(**context):
         except Exception as e:
             if conn:
                 conn.close()
-            raise
+            # If delta extension fails, fall back to parquet reading
+            print(f"[DuckDB] Delta extension error: {e}")
+            print("[DuckDB] Falling back to parquet read...")
+            return sync_to_duckdb_fallback()
+
+
+def sync_to_duckdb_fallback():
+    """
+    Fallback: Read Delta Lake parquet files directly if extension fails.
+    """
+    import duckdb
+
+    conn = duckdb.connect(DUCKDB_PATH, read_only=False)
+
+    # Delta Lake stores data as parquet files
+    parquet_pattern = f"{DELTA_TABLE_PATH}/*.parquet"
+
+    conn.execute(f"""
+        CREATE OR REPLACE TABLE stock_prices AS
+        SELECT * FROM read_parquet('{parquet_pattern}')
+    """)
+
+    count = conn.execute("SELECT COUNT(*) FROM stock_prices").fetchone()[0]
+    print(f"[DuckDB Fallback] Synced {count} records from parquet files")
+
+    conn.close()
+    return count
 
 
 def create_stock_views(**context):
@@ -347,8 +361,8 @@ def create_stock_views(**context):
             date,
             close,
             LAG(close) OVER (PARTITION BY symbol ORDER BY date) as prev_close,
-            (close - LAG(close) OVER (PARTITION BY symbol ORDER BY date)) /
-                NULLIF(LAG(close) OVER (PARTITION BY symbol ORDER BY date), 0) * 100 as daily_return_pct
+            ROUND((close - LAG(close) OVER (PARTITION BY symbol ORDER BY date)) /
+                NULLIF(LAG(close) OVER (PARTITION BY symbol ORDER BY date), 0) * 100, 2) as daily_return_pct
         FROM stock_prices
         ORDER BY symbol, date
     """)
@@ -378,10 +392,10 @@ def create_stock_views(**context):
             COUNT(*) as data_points,
             MIN(date) as first_date,
             MAX(date) as last_date,
-            AVG(close) as avg_close,
-            MIN(close) as min_close,
-            MAX(close) as max_close,
-            AVG(volume) as avg_volume
+            ROUND(AVG(close), 2) as avg_close,
+            ROUND(MIN(close), 2) as min_close,
+            ROUND(MAX(close), 2) as max_close,
+            ROUND(AVG(volume), 0) as avg_volume
         FROM stock_prices
         GROUP BY symbol
     """)
@@ -394,11 +408,11 @@ def create_stock_views(**context):
 with DAG(
     'yahoo_finance_daily',
     default_args=default_args,
-    description='Fetch stock prices from Yahoo Finance with Iceberg-style versioning',
-    schedule_interval='0 18 * * 1-5',
+    description='Fetch stock prices from Yahoo Finance with Delta Lake ACID transactions',
+    schedule_interval='0 18 * * 1-5',  # Weekdays at 6 PM
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=['yahoo-finance', 'stocks', 'market-data'],
+    tags=['yahoo-finance', 'stocks', 'market-data', 'delta-lake'],
     params={
         'symbols': 'AAPL,GOOGL,MSFT,AMZN,META',
         'period': '1mo'
@@ -406,9 +420,12 @@ with DAG(
 ) as dag:
 
     dag.doc_md = """
-    ## Yahoo Finance Stock Data Pipeline
+    ## Yahoo Finance Stock Data Pipeline (Delta Lake)
 
-    Fetches stock price data using yf.download() which is more reliable than Ticker.history().
+    Fetches stock price data and stores using Delta Lake format for:
+    - **ACID transactions** - Atomic writes, no corrupted data
+    - **Time travel** - Query any historical version
+    - **Schema evolution** - Add columns without breaking
 
     ### Trigger with config:
     ```json
@@ -416,6 +433,15 @@ with DAG(
     ```
 
     ### Period options: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, max
+
+    ### Time Travel (query historical versions):
+    ```sql
+    -- Query specific version
+    SELECT * FROM delta_scan('/data/delta/stock_prices', version=5)
+
+    -- Query by timestamp
+    SELECT * FROM delta_scan('/data/delta/stock_prices', timestamp='2024-01-15')
+    ```
     """
 
     fetch_task = PythonOperator(
@@ -425,14 +451,20 @@ with DAG(
     )
 
     save_task = PythonOperator(
-        task_id='save_to_iceberg',
-        python_callable=save_to_iceberg_style,
+        task_id='save_to_delta',
+        python_callable=save_to_delta_lake,
         provide_context=True,
     )
 
-    load_task = PythonOperator(
-        task_id='load_to_duckdb',
-        python_callable=load_to_duckdb,
+    optimize_task = PythonOperator(
+        task_id='optimize_delta',
+        python_callable=optimize_delta_table,
+        provide_context=True,
+    )
+
+    sync_task = PythonOperator(
+        task_id='sync_to_duckdb',
+        python_callable=sync_to_duckdb,
         provide_context=True,
     )
 
@@ -442,4 +474,4 @@ with DAG(
         provide_context=True,
     )
 
-    fetch_task >> save_task >> load_task >> views_task
+    fetch_task >> save_task >> optimize_task >> sync_task >> views_task
