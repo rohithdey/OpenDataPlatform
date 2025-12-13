@@ -607,34 +607,49 @@ async def fetch_yahoo_finance_now(config: YahooFinanceConfig):
         all_data = []
         errors = []
 
+        def safe_column_name(col):
+            """Convert column name to lowercase string, handling tuples from multi-index"""
+            if isinstance(col, tuple):
+                return str(col[-1]).lower().replace(' ', '_')
+            return str(col).lower().replace(' ', '_')
+
         # Try bulk download first (faster and more reliable)
         try:
-            df = yf.download(
-                tickers=config.symbols,
-                period=config.period,
-                group_by='ticker',
-                auto_adjust=True,
-                progress=False,
-                threads=True
-            )
-
-            if not df.empty:
-                if len(config.symbols) == 1:
-                    # Single symbol: columns are just OHLCV
-                    symbol = config.symbols[0]
+            if len(config.symbols) == 1:
+                # Single symbol - don't use group_by to avoid multi-index issues
+                symbol = config.symbols[0]
+                df = yf.download(
+                    tickers=symbol,
+                    period=config.period,
+                    auto_adjust=True,
+                    progress=False
+                )
+                if not df.empty:
                     df = df.reset_index()
                     df['symbol'] = symbol
-                    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                    df.columns = [safe_column_name(c) for c in df.columns]
                     all_data.append(df)
                 else:
-                    # Multiple symbols: columns are multi-index (symbol, metric)
+                    errors.append(f"No data for {symbol}")
+            else:
+                # Multiple symbols - use group_by='ticker'
+                df = yf.download(
+                    tickers=config.symbols,
+                    period=config.period,
+                    group_by='ticker',
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True
+                )
+
+                if not df.empty:
                     for symbol in config.symbols:
                         try:
                             if symbol in df.columns.get_level_values(0):
                                 symbol_df = df[symbol].copy()
                                 symbol_df = symbol_df.reset_index()
                                 symbol_df['symbol'] = symbol
-                                symbol_df.columns = [c.lower().replace(' ', '_') for c in symbol_df.columns]
+                                symbol_df.columns = [safe_column_name(c) for c in symbol_df.columns]
                                 symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
                                 if not symbol_df.empty:
                                     all_data.append(symbol_df)
@@ -678,25 +693,40 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
         # Note: yfinance >= 0.2.40 doesn't work with custom requests.Session
         all_data = []
 
-        try:
-            df = yf.download(
-                tickers=config.symbols,
-                period=config.period,
-                group_by='ticker',
-                auto_adjust=True,
-                progress=False,
-                threads=True
-            )
+        def safe_column_name(col):
+            """Convert column name to lowercase string, handling tuples from multi-index"""
+            if isinstance(col, tuple):
+                return str(col[-1]).lower().replace(' ', '_')
+            return str(col).lower().replace(' ', '_')
 
-            if not df.empty:
-                if len(config.symbols) == 1:
-                    symbol = config.symbols[0]
+        try:
+            if len(config.symbols) == 1:
+                # Single symbol - don't use group_by to avoid multi-index issues
+                symbol = config.symbols[0]
+                df = yf.download(
+                    tickers=symbol,
+                    period=config.period,
+                    auto_adjust=True,
+                    progress=False
+                )
+                if not df.empty:
                     df = df.reset_index()
                     df['symbol'] = symbol
                     df['fetch_timestamp'] = datetime.now().isoformat()
-                    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                    df.columns = [safe_column_name(c) for c in df.columns]
                     all_data.append(df)
-                else:
+            else:
+                # Multiple symbols - use group_by='ticker'
+                df = yf.download(
+                    tickers=config.symbols,
+                    period=config.period,
+                    group_by='ticker',
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True
+                )
+
+                if not df.empty:
                     for symbol in config.symbols:
                         try:
                             if symbol in df.columns.get_level_values(0):
@@ -704,7 +734,7 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
                                 symbol_df = symbol_df.reset_index()
                                 symbol_df['symbol'] = symbol
                                 symbol_df['fetch_timestamp'] = datetime.now().isoformat()
-                                symbol_df.columns = [c.lower().replace(' ', '_') for c in symbol_df.columns]
+                                symbol_df.columns = [safe_column_name(c) for c in symbol_df.columns]
                                 symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
                                 if not symbol_df.empty:
                                     all_data.append(symbol_df)
@@ -813,25 +843,31 @@ def fetch_and_save_stock_data(**context):
     # Note: yfinance >= 0.2.40 doesn't work with custom requests.Session
     all_data = []
 
-    try:
-        df = yf.download(
-            tickers=SYMBOLS,
-            period=PERIOD,
-            group_by='ticker',
-            auto_adjust=True,
-            progress=False,
-            threads=True
-        )
+    def safe_col(col):
+        if isinstance(col, tuple):
+            return str(col[-1]).lower().replace(' ', '_')
+        return str(col).lower().replace(' ', '_')
 
-        if not df.empty:
-            if len(SYMBOLS) == 1:
-                symbol = SYMBOLS[0]
+    try:
+        if len(SYMBOLS) == 1:
+            symbol = SYMBOLS[0]
+            df = yf.download(tickers=symbol, period=PERIOD, auto_adjust=True, progress=False)
+            if not df.empty:
                 df = df.reset_index()
                 df['symbol'] = symbol
                 df['fetch_timestamp'] = datetime.now().isoformat()
-                df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                df.columns = [safe_col(c) for c in df.columns]
                 all_data.append(df)
-            else:
+        else:
+            df = yf.download(
+                tickers=SYMBOLS,
+                period=PERIOD,
+                group_by='ticker',
+                auto_adjust=True,
+                progress=False,
+                threads=True
+            )
+            if not df.empty:
                 for symbol in SYMBOLS:
                     try:
                         if symbol in df.columns.get_level_values(0):
@@ -839,7 +875,7 @@ def fetch_and_save_stock_data(**context):
                             symbol_df = symbol_df.reset_index()
                             symbol_df['symbol'] = symbol
                             symbol_df['fetch_timestamp'] = datetime.now().isoformat()
-                            symbol_df.columns = [c.lower().replace(' ', '_') for c in symbol_df.columns]
+                            symbol_df.columns = [safe_col(c) for c in symbol_df.columns]
                             symbol_df = symbol_df.dropna(subset=['open', 'high', 'low', 'close'], how='all')
                             if not symbol_df.empty:
                                 all_data.append(symbol_df)
