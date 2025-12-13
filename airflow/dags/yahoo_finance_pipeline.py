@@ -270,21 +270,42 @@ def load_to_duckdb(**context):
             available_cols = list(parquet_df.columns)
             print(f"[DuckDB] Parquet columns: {available_cols}")
 
-            # Build dynamic INSERT based on available columns
-            target_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol', 'fetch_timestamp']
+            # Get table columns to handle schema mismatch
+            table_cols = conn.execute("SELECT * FROM stock_prices LIMIT 0").description
+            table_col_names = [col[0] for col in table_cols]
+            print(f"[DuckDB] Table columns: {table_col_names}")
 
+            # Build fully dynamic INSERT - only use columns that exist in BOTH
+            base_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']
+            insert_cols = []
             select_parts = []
-            for col in target_cols:
-                if col in available_cols:
-                    select_parts.append(col)
-                else:
-                    select_parts.append(f"NULL as {col}")
 
+            for col in base_cols:
+                if col in table_col_names:
+                    insert_cols.append(col)
+                    if col in available_cols:
+                        select_parts.append(f'"{col}"')
+                    else:
+                        select_parts.append('NULL')
+
+            # Add optional columns only if they exist in the table
+            if 'fetch_timestamp' in table_col_names:
+                insert_cols.append('fetch_timestamp')
+                if 'fetch_timestamp' in available_cols:
+                    select_parts.append('"fetch_timestamp"')
+                else:
+                    select_parts.append('NULL')
+
+            if 'ingestion_date' in table_col_names:
+                insert_cols.append('ingestion_date')
+                select_parts.append('CURRENT_DATE')
+
+            insert_clause = ", ".join(insert_cols)
             select_clause = ", ".join(select_parts)
 
             conn.execute(f"""
-                INSERT INTO stock_prices (date, open, high, low, close, volume, symbol, fetch_timestamp, ingestion_date)
-                SELECT {select_clause}, CURRENT_DATE as ingestion_date
+                INSERT INTO stock_prices ({insert_clause})
+                SELECT {select_clause}
                 FROM read_parquet('{parquet_path}')
             """)
 

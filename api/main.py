@@ -839,9 +839,15 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
                 else:
                     select_parts.append(f"NULL")
 
-        # Add ingestion_date
-        insert_cols.append('ingestion_date')
-        select_parts.append('CURRENT_DATE')
+        # Add ingestion_date only if it exists in the table
+        if 'ingestion_date' in table_col_names:
+            insert_cols.append('ingestion_date')
+            select_parts.append('CURRENT_DATE')
+
+        # Add fetch_timestamp if it exists in both parquet and table
+        if 'fetch_timestamp' in table_col_names and 'fetch_timestamp' in available_cols:
+            insert_cols.append('fetch_timestamp')
+            select_parts.append('"fetch_timestamp"')
 
         insert_clause = ", ".join(insert_cols)
         select_clause = ", ".join(select_parts)
@@ -974,13 +980,38 @@ def fetch_and_save_stock_data(**context):
     parquet_cols = conn.execute(f"SELECT * FROM read_parquet('{{parquet_path}}') LIMIT 0").description
     available = [col[0] for col in parquet_cols]
 
-    # Build dynamic SELECT
-    target = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol', 'fetch_timestamp']
-    parts = [f'"{c}"' if c in available else f'NULL as {c}' for c in target]
+    # Get table columns
+    table_cols = conn.execute("SELECT * FROM stock_prices LIMIT 0").description
+    table_col_names = [col[0] for col in table_cols]
+
+    # Build fully dynamic INSERT - only use columns that exist in BOTH
+    base_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']
+    insert_cols = []
+    select_parts = []
+
+    for col in base_cols:
+        if col in table_col_names:
+            insert_cols.append(col)
+            if col in available:
+                select_parts.append(f'"{col}"')
+            else:
+                select_parts.append('NULL')
+
+    # Add optional columns only if they exist in both
+    if 'fetch_timestamp' in table_col_names and 'fetch_timestamp' in available:
+        insert_cols.append('fetch_timestamp')
+        select_parts.append('"fetch_timestamp"')
+
+    if 'ingestion_date' in table_col_names:
+        insert_cols.append('ingestion_date')
+        select_parts.append('CURRENT_DATE')
+
+    insert_clause = ', '.join(insert_cols)
+    select_clause = ', '.join(select_parts)
 
     conn.execute(f"""
-        INSERT INTO stock_prices (date, open, high, low, close, volume, symbol, fetch_timestamp, ingestion_date)
-        SELECT {{', '.join(parts)}}, CURRENT_DATE
+        INSERT INTO stock_prices ({{insert_clause}})
+        SELECT {{select_clause}}
         FROM read_parquet('{{parquet_path}}')
     """)
 
