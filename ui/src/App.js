@@ -220,12 +220,15 @@ function DataExplorer() {
   );
 }
 
-// SQL Editor component
+// SQL Editor component - DuckDB IDE via CloudBeaver
 function SQLEditor() {
+  const [mode, setMode] = useState('ide'); // 'ide' or 'quick'
   const [query, setQuery] = useState('SELECT * FROM ');
   const [results, setResults] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
+
+  const CLOUDBEAVER_URL = process.env.REACT_APP_CLOUDBEAVER_URL || 'http://localhost:8978';
 
   const executeQuery = async () => {
     setLoading(true);
@@ -240,77 +243,135 @@ function SQLEditor() {
     setLoading(false);
   };
 
+  const openCloudBeaver = () => {
+    window.open(CLOUDBEAVER_URL, '_blank');
+  };
+
   return (
     <div className="sql-editor">
-      <div className="editor-section">
-        <div className="editor-header">
-          <h3>SQL Query</h3>
-          <button onClick={executeQuery} disabled={loading} className="run-button">
-            <Play size={16} />
-            {loading ? 'Running...' : 'Run Query'}
-          </button>
-        </div>
-        <textarea
-          className="query-input"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Enter your SQL query..."
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-              executeQuery();
-            }
-          }}
-        />
-        <small className="hint">Press Ctrl+Enter to execute</small>
+      <div className="mode-toggle">
+        <button
+          className={mode === 'ide' ? 'active' : ''}
+          onClick={() => setMode('ide')}
+        >
+          <Database size={16} /> DuckDB IDE
+        </button>
+        <button
+          className={mode === 'quick' ? 'active' : ''}
+          onClick={() => setMode('quick')}
+        >
+          <Code size={16} /> Quick Query
+        </button>
       </div>
 
-      <div className="results-section">
-        {error && (
-          <div className="error-message">
-            <AlertCircle size={16} />
-            {error}
-          </div>
-        )}
+      {mode === 'ide' ? (
+        <div className="cloudbeaver-section">
+          <div className="ide-intro">
+            <h2><Database size={28} /> DuckDB SQL IDE</h2>
+            <p>Use CloudBeaver for a full-featured database IDE with schema browser, query history, and export options.</p>
 
-        {results && (
-          <>
-            <div className="results-header">
-              <h3>Results</h3>
-              {results.row_count !== undefined && (
-                <span>{results.row_count} rows returned</span>
-              )}
+            <button onClick={openCloudBeaver} className="launch-button">
+              <Database size={20} />
+              Open DuckDB IDE
+            </button>
+
+            <div className="ide-features">
+              <h4>Features:</h4>
+              <ul>
+                <li><CheckCircle size={14} /> Visual schema browser</li>
+                <li><CheckCircle size={14} /> SQL auto-complete</li>
+                <li><CheckCircle size={14} /> Query history</li>
+                <li><CheckCircle size={14} /> Export to CSV/JSON/Excel</li>
+                <li><CheckCircle size={14} /> Multiple query tabs</li>
+                <li><CheckCircle size={14} /> Data visualization</li>
+              </ul>
             </div>
 
-            {results.data ? (
-              <div className="data-table-container">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      {results.columns.map(col => (
-                        <th key={col}>{col}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {results.data.map((row, i) => (
-                      <tr key={i}>
-                        {results.columns.map(col => (
-                          <td key={col}>{String(row[col] ?? '')}</td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <div className="success-message">
-                <CheckCircle size={16} />
-                {results.message}
+            <div className="first-time-setup">
+              <h4><AlertCircle size={16} /> First Time Setup:</h4>
+              <ol>
+                <li>Click "Open DuckDB IDE" above</li>
+                <li>Create an admin account (first visit only)</li>
+                <li>Click <strong>+ New Connection</strong> → select <strong>DuckDB</strong></li>
+                <li>Set Path: <code>/opt/data/warehouse.duckdb</code></li>
+                <li>Click "Test Connection" then "Create"</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="editor-section">
+            <div className="editor-header">
+              <h3>Quick SQL Query</h3>
+              <button onClick={executeQuery} disabled={loading} className="run-button">
+                <Play size={16} />
+                {loading ? 'Running...' : 'Run Query'}
+              </button>
+            </div>
+            <textarea
+              className="query-input"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Enter your SQL query..."
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                  executeQuery();
+                }
+              }}
+            />
+            <small className="hint">Press Ctrl+Enter to execute. For advanced features, use the DuckDB IDE tab.</small>
+          </div>
+
+          <div className="results-section">
+            {error && (
+              <div className="error-message">
+                <AlertCircle size={16} />
+                {error}
               </div>
             )}
-          </>
-        )}
-      </div>
+
+            {results && (
+              <>
+                <div className="results-header">
+                  <h3>Results</h3>
+                  {results.row_count !== undefined && (
+                    <span>{results.row_count} rows returned</span>
+                  )}
+                </div>
+
+                {results.data ? (
+                  <div className="data-table-container">
+                    <table className="data-table">
+                      <thead>
+                        <tr>
+                          {results.columns.map(col => (
+                            <th key={col}>{col}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {results.data.map((row, i) => (
+                          <tr key={i}>
+                            {results.columns.map(col => (
+                              <td key={col}>{String(row[col] ?? '')}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="success-message">
+                    <CheckCircle size={16} />
+                    {results.message}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
