@@ -1,0 +1,85 @@
+version: 2
+
+models:
+  - name: stg_stock_prices
+    description: "Cleaned stock price data from Yahoo Finance"
+    columns:
+      - name: symbol
+        description: "Stock ticker symbol"
+        tests:
+          - not_null
+      - name: price_date
+        description: "Trading date"
+        tests:
+          - not_null
+      - name: open_price
+        description: "Opening price"
+      - name: high_price
+        description: "Highest price during the day"
+      - name: low_price
+        description: "Lowest price during the day"
+      - name: close_price
+        description: "Closing price"
+        tests:
+          - not_null
+      - name: volume
+        description: "Trading volume"
+
+  - name: stg_fred_economic
+    description: "Cleaned economic indicators from FRED"
+    columns:
+      - name: series_id
+        description: "FRED series identifier"
+        tests:
+          - not_null
+      - name: observation_date
+        description: "Date of observation"
+        tests:
+          - not_null
+      - name: value
+        description: "Indicator value"
+
+  - name: stg_sec_filings
+    description: "Cleaned SEC EDGAR filings data"
+    columns:
+      - name: ticker
+        description: "Stock ticker symbol"
+        tests:
+          - not_null
+      - name: cik
+        description: "SEC CIK number"
+      - name: form_type
+        description: "Filing type (10-K, 10-Q, 8-K, etc.)"
+        tests:
+          - not_null
+      - name: filing_date
+        description: "Date of filing"
+
+  - name: stg_crypto_prices
+    description: "Cleaned cryptocurrency data from CoinGecko"
+    columns:
+      - name: symbol
+        description: "Crypto symbol (BTC, ETH, etc.)"
+        tests:
+          - not_null
+      - name: coin_id
+        description: "CoinGecko coin identifier"
+      - name: current_price
+        description: "Current price in USD"
+      - name: market_cap
+        description: "Market capitalization"
+      - name: market_cap_rank
+        description: "Rank by market cap"
+
+sources:
+  - name: raw
+    description: "Raw data from Delta Lake synced to DuckDB"
+    tables:
+      - name: stock_prices
+        description: "Raw stock prices from Yahoo Finance"
+      - name: fred_economic
+        description: "Raw FRED economic data"
+      - name: sec_filings
+        description: "Raw SEC filings"
+      - name: crypto_prices
+        description: "Raw cryptocurrency prices"

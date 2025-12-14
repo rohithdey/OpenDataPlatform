@@ -1,0 +1,37 @@
+version: 2
+
+models:
+  - name: int_stock_daily_metrics
+    description: "Daily stock metrics with returns and moving averages"
+    columns:
+      - name: symbol
+        tests:
+          - not_null
+      - name: price_date
+        tests:
+          - not_null
+      - name: daily_return_pct
+        description: "Daily percentage return"
+      - name: moving_avg_20
+        description: "20-day moving average"
+      - name: volatility_20
+        description: "20-day rolling volatility"
+
+  - name: int_treasury_yield_curve
+    description: "Treasury yield curve analysis"
+    columns:
+      - name: observation_date
+        tests:
+          - not_null
+      - name: yield_2y
+        description: "2-year Treasury yield"
+      - name: yield_10y
+        description: "10-year Treasury yield"
+      - name: spread_10y_2y
+        description: "Yield curve spread (10Y - 2Y)"
+
+  - name: int_economic_indicators_wide
+    description: "Economic indicators pivoted to wide format"
+
+  - name: int_filing_activity
+    description: "SEC filing activity by company"

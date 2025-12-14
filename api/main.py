@@ -1980,6 +1980,209 @@ async def pull_ollama_model(model: str = Body(..., embed=True)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============== DBT Endpoints ==============
+
+DBT_PROJECT_DIR = "/app/dbt"
+
+@app.get("/dbt/models")
+async def list_dbt_models():
+    """List all DBT models organized by layer."""
+    try:
+        models = {
+            "staging": [],
+            "intermediate": [],
+            "marts": []
+        }
+
+        for layer in models.keys():
+            layer_dir = os.path.join(DBT_PROJECT_DIR, "models", layer)
+            if os.path.exists(layer_dir):
+                for f in os.listdir(layer_dir):
+                    if f.endswith('.sql'):
+                        model_name = f.replace('.sql', '')
+                        models[layer].append({
+                            "name": model_name,
+                            "path": f"models/{layer}/{f}"
+                        })
+
+        return {
+            "project_dir": DBT_PROJECT_DIR,
+            "models": models,
+            "total_models": sum(len(v) for v in models.values())
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dbt/model/{model_name}")
+async def get_dbt_model(model_name: str):
+    """Get the SQL content of a specific DBT model."""
+    try:
+        # Search in all layers
+        for layer in ['staging', 'intermediate', 'marts']:
+            model_path = os.path.join(DBT_PROJECT_DIR, "models", layer, f"{model_name}.sql")
+            if os.path.exists(model_path):
+                with open(model_path, 'r') as f:
+                    content = f.read()
+                return {
+                    "model": model_name,
+                    "layer": layer,
+                    "path": model_path,
+                    "sql": content
+                }
+
+        raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dbt/run")
+async def run_dbt(
+    selector: Optional[str] = None,
+    full_refresh: bool = False
+):
+    """
+    Run DBT models.
+
+    Args:
+        selector: DBT selector (e.g., 'staging', 'marts', 'mart_stock_summary')
+        full_refresh: Force full rebuild of incremental models
+    """
+    import subprocess
+
+    try:
+        cmd = ["dbt", "run", "--project-dir", DBT_PROJECT_DIR, "--profiles-dir", DBT_PROJECT_DIR]
+
+        if selector:
+            cmd.extend(["--select", selector])
+
+        if full_refresh:
+            cmd.append("--full-refresh")
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        return {
+            "success": result.returncode == 0,
+            "command": " ".join(cmd),
+            "stdout": result.stdout,
+            "stderr": result.stderr if result.returncode != 0 else None
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="DBT run timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dbt/test")
+async def run_dbt_tests(selector: Optional[str] = None):
+    """Run DBT tests to validate data quality."""
+    import subprocess
+
+    try:
+        cmd = ["dbt", "test", "--project-dir", DBT_PROJECT_DIR, "--profiles-dir", DBT_PROJECT_DIR]
+
+        if selector:
+            cmd.extend(["--select", selector])
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        return {
+            "success": result.returncode == 0,
+            "command": " ".join(cmd),
+            "stdout": result.stdout,
+            "stderr": result.stderr if result.returncode != 0 else None
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="DBT test timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dbt/docs")
+async def get_dbt_docs():
+    """Get DBT documentation catalog if available."""
+    try:
+        catalog_path = os.path.join(DBT_PROJECT_DIR, "target", "catalog.json")
+        manifest_path = os.path.join(DBT_PROJECT_DIR, "target", "manifest.json")
+
+        result = {
+            "catalog_exists": os.path.exists(catalog_path),
+            "manifest_exists": os.path.exists(manifest_path),
+        }
+
+        if os.path.exists(manifest_path):
+            import json
+            with open(manifest_path, 'r') as f:
+                manifest = json.load(f)
+                result["models"] = list(manifest.get("nodes", {}).keys())[:20]  # First 20 nodes
+                result["sources"] = list(manifest.get("sources", {}).keys())
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dbt/lineage/{model_name}")
+async def get_model_lineage(model_name: str):
+    """Get the lineage (dependencies) for a DBT model."""
+    try:
+        manifest_path = os.path.join(DBT_PROJECT_DIR, "target", "manifest.json")
+
+        if not os.path.exists(manifest_path):
+            return {
+                "message": "Run 'dbt docs generate' first to build lineage",
+                "model": model_name
+            }
+
+        import json
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+
+        # Find the model node
+        nodes = manifest.get("nodes", {})
+        model_key = None
+        for key in nodes.keys():
+            if model_name in key:
+                model_key = key
+                break
+
+        if not model_key:
+            raise HTTPException(status_code=404, detail=f"Model {model_name} not found in manifest")
+
+        node = nodes[model_key]
+
+        return {
+            "model": model_name,
+            "depends_on": node.get("depends_on", {}).get("nodes", []),
+            "description": node.get("description", ""),
+            "columns": list(node.get("columns", {}).keys()),
+            "tags": node.get("tags", []),
+            "materialized": node.get("config", {}).get("materialized", "view")
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

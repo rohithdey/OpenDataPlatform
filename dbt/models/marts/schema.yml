@@ -1,0 +1,22 @@
+version: 2
+
+models:
+  - name: mart_stock_summary
+    description: "Stock summary with latest prices and key metrics"
+    columns:
+      - name: symbol
+        tests:
+          - unique
+          - not_null
+
+  - name: mart_market_overview
+    description: "Daily market overview combining stocks, crypto, and economic data"
+
+  - name: mart_portfolio_analytics
+    description: "Portfolio-level analytics for all tracked assets"
+
+  - name: mart_economic_dashboard
+    description: "Economic dashboard with key indicators and trends"
+
+  - name: mart_company_intelligence
+    description: "Company intelligence combining stock data with SEC filings"

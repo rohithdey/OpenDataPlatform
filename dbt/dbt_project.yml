@@ -15,3 +15,28 @@ target-path: "target"
 clean-targets:
   - "target"
   - "dbt_packages"
+
+# Model configurations
+models:
+  data_platform:
+    # Staging models - cleaned source data
+    staging:
+      +materialized: view
+      +schema: staging
+
+    # Intermediate models - business logic transformations
+    intermediate:
+      +materialized: view
+      +schema: intermediate
+
+    # Mart models - final analytics tables
+    marts:
+      +materialized: table
+      +schema: marts
+
+# Variables for configuration
+vars:
+  # Default lookback periods
+  default_lookback_days: 365
+  moving_avg_window: 20
+  volatility_window: 30

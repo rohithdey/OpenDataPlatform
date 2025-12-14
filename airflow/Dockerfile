@@ -12,4 +12,5 @@ RUN pip install --no-cache-dir \
     lxml==5.1.0 \
     html5lib \
     beautifulsoup4 \
-    fredapi>=0.5.1
+    fredapi>=0.5.1 \
+    dbt-duckdb>=1.7.0

@@ -1,0 +1,67 @@
+version: 2
+
+sources:
+  - name: raw
+    description: "Raw data from Delta Lake synced to DuckDB"
+    database: warehouse  # DuckDB database
+    schema: main  # Default schema in DuckDB
+    tables:
+      - name: stock_prices
+        description: "Raw stock prices from Yahoo Finance via Delta Lake"
+        columns:
+          - name: date
+            description: "Trading date"
+          - name: open
+            description: "Opening price"
+          - name: high
+            description: "High price"
+          - name: low
+            description: "Low price"
+          - name: close
+            description: "Closing price"
+          - name: volume
+            description: "Trading volume"
+          - name: symbol
+            description: "Stock ticker symbol"
+
+      - name: fred_economic
+        description: "FRED economic indicators"
+        columns:
+          - name: series_id
+            description: "FRED series identifier"
+          - name: date
+            description: "Observation date"
+          - name: value
+            description: "Indicator value"
+
+      - name: sec_filings
+        description: "SEC EDGAR company filings"
+        columns:
+          - name: ticker
+            description: "Stock ticker"
+          - name: cik
+            description: "SEC CIK number"
+          - name: form_type
+            description: "Filing type"
+          - name: filing_date
+            description: "Filing date"
+
+      - name: crypto_prices
+        description: "Cryptocurrency prices from CoinGecko"
+        columns:
+          - name: coin_id
+            description: "CoinGecko coin ID"
+          - name: symbol
+            description: "Crypto symbol"
+          - name: current_price
+            description: "Current price in USD"
+          - name: market_cap
+            description: "Market capitalization"
+
+      - name: gleif_entities
+        description: "GLEIF legal entity data"
+        columns:
+          - name: lei
+            description: "Legal Entity Identifier"
+          - name: legal_name
+            description: "Legal name of entity"
