@@ -15,6 +15,16 @@ from datetime import datetime, timedelta
 import os
 import pandas as pd
 
+# REVIEW NOTES:
+# - This DAG makes outbound calls to Yahoo Finance without explicit timeouts;
+#   if the service throttles or the network drops, tasks can hang until the
+#   Airflow task timeout is reached.
+# - Symbols/period parameters are not validated before running; defensive checks
+#   (e.g., max symbol count, whitelist of period values) would avoid accidental
+#   heavy downloads on SMB hardware like a MacBook Air.
+# - The schedule is hard-coded to 6 PM UTC; consider parameterizing timezone or
+#   documenting the expected business timezone for predictable runs.
+
 # Configuration
 DATA_DIR = '/opt/airflow/data'
 DUCKDB_PATH = '/opt/airflow/data/warehouse.duckdb'

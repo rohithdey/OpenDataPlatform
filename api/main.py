@@ -35,6 +35,9 @@ app.add_middleware(
 )
 
 # Configuration
+# NOTE: These defaults are convenient for local demos but should be overridden via
+# environment variables in production deployments (e.g., non-admin Airflow creds,
+# SSL-enabled endpoints, and isolated DuckDB paths per environment).
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "/app/data/warehouse.duckdb")
 AIRFLOW_API_URL = os.getenv("AIRFLOW_API_URL", "http://airflow-webserver:8080/api/v1")
 AIRFLOW_USERNAME = os.getenv("AIRFLOW_USERNAME", "admin")
@@ -70,6 +73,8 @@ def get_db_connection(read_only=True):
     """Get DuckDB connection - uses read_only by default to avoid locks"""
     conn = duckdb.connect(DUCKDB_PATH, read_only=read_only)
     # Note: Iceberg extension removed - not needed and causes issues on ARM Macs
+    # TODO: wrap in a context manager to ensure the connection is always closed
+    # when exceptions are raised in callers.
     return conn
 
 # Vector store for semantic search
@@ -103,7 +108,7 @@ class VectorStore:
         # Get data from table
         query = f"SELECT * FROM {table_name}"
         df = conn.execute(query).fetchdf()
-        
+
         # Create combined text from specified columns
         df['_combined_text'] = df[text_columns].astype(str).agg(' | '.join, axis=1)
         
@@ -116,7 +121,12 @@ class VectorStore:
             'data': json.loads(df.to_json(orient='records', date_format='iso')),
             'text_columns': text_columns
         }
-        
+
+        # REVIEW: This is kept in memory only. For production durability and
+        # multi-worker scaling, consider persisting embeddings to disk or a
+        # vector database (e.g., pgvector, LanceDB, Qdrant) instead of storing
+        # them on the process object.
+
         conn.close()
         return {"status": "success", "rows_vectorized": len(df)}
     
@@ -210,7 +220,12 @@ async def execute_query(query_request: SQLQuery):
         # Check if it's a SELECT query
         query = query_request.query.strip()
         is_select = query.upper().startswith("SELECT") or query.upper().startswith("WITH") or query.upper().startswith("SHOW") or query.upper().startswith("DESCRIBE")
-        
+
+        # REVIEW: No SQL injection protection is added here because the API
+        # expects raw SQL. For a multi-tenant deployment, consider adding an
+        # allowlist of statements or a sandboxed parser to avoid destructive
+        # operations (e.g., DROP TABLE) when exposed to untrusted users.
+
         # Use read_only for SELECT, write access for modifications
         conn = get_db_connection(read_only=is_select)
         
@@ -254,7 +269,12 @@ async def upload_file(
             conn.execute(f"CREATE TABLE IF NOT EXISTS {table_name} AS SELECT * FROM read_parquet('{temp_path}')")
         else:
             raise HTTPException(status_code=400, detail="Unsupported file format")
-        
+
+        # REVIEW: Table names are not validated or quoted, so user input could
+        # collide with existing schema or create awkward identifiers. Consider
+        # enforcing a safe naming convention (alphanumeric + underscore) before
+        # creating tables from uploads.
+
         # Get row count
         count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
         conn.close()
@@ -339,7 +359,11 @@ async def ask_question(query: SemanticQuery):
                 }
             except Exception as e:
                 print(f"OpenAI error: {e}")
-        
+
+        # REVIEW: No streaming or token-usage guards are applied; a malicious
+        # prompt could incur unexpected OpenAI costs. Add rate limiting and a
+        # max_tokens clamp per user/session if this endpoint becomes public.
+
         # Fallback: return the most relevant data
         return {
             "answer": f"Here are the most relevant records for your question:",
@@ -393,6 +417,12 @@ async def trigger_dag(dag_id: str, conf: Optional[Dict[str, Any]] = None):
         return response.json()
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Airflow API error: {str(e)}")
+
+
+# REVIEW: Dynamic DAG generation currently writes files directly into the
+# Airflow DAGs folder without linting or syntax validation. A failed write will
+# silently produce an unusable DAG until the scheduler is restarted. Consider
+# validating rendered code with `python -m py_compile` and refreshing Airflow.
 
 @app.get("/dags/{dag_id}/runs")
 async def get_dag_runs(dag_id: str, limit: int = 10):
@@ -456,6 +486,10 @@ def generate_dag_code(config: DAGConfig) -> str:
     # Custom extraction logic
     df = pd.DataFrame()
 '''
+
+    # REVIEW: User-provided values are interpolated directly into the template,
+    # which allows Python injection if untrusted input is passed. Sanitizing
+    # strings or using a safer templating library would reduce that risk.
     
     dag_code = f'''"""
 Auto-generated DAG: {config.dag_id}
@@ -545,6 +579,11 @@ async def get_dbt_model(model_name: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# REVIEW: The Yahoo Finance endpoints assume outbound internet and may stall on
+# rate limits. Consider adding shorter timeouts and circuit breakers so the API
+# process does not block under poor network conditions.
 
 # ============== Yahoo Finance Endpoints ==============
 

@@ -210,6 +210,25 @@ lsof -i :8080
 echo "AIRFLOW_UID=$(id -u)" >> .env
 ```
 
+## Running the Comprehensive Test Suite with Docker
+
+The end-to-end tests assume all services are running inside Docker. On macOS (including Apple Silicon/M-series), use these steps:
+
+1. **Ensure Docker is available**
+   - Docker Desktop should be running and `docker compose version` should succeed.
+2. **Start or rebuild the stack**
+   - `docker compose up -d --build`
+   - Wait for the API (8000), UI (3000), Airflow (8080), and Ollama (11434) containers to become healthy: `docker compose ps`
+3. **Install test-only Python deps in the API container**
+   - `docker compose exec api pip install --no-cache-dir yfinance`
+4. **Run the full test suite inside the API container**
+   - `docker compose exec api python /app/test_all.py > /app/data/test_results.log 2>&1`
+5. **Retrieve and review the log**
+   - `docker compose cp api:/app/data/test_results.log ./test_results.log`
+   - Open `test_results.log` locally and confirm API, Airflow, Yahoo Finance, and Ollama checks are green.
+
+If any HTTP checks fail, confirm the corresponding container is healthy, network ports are free, and required models/data (e.g., `ollama pull llama3.2`) are present inside the running services.
+
 ## License
 
 MIT
