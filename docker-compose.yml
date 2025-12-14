@@ -160,6 +160,21 @@ services:
         reservations:
           memory: 4G
 
+  # DuckDB Web IDE (CloudBeaver Community Edition)
+  # Access at http://localhost:8978
+  duckdb-ide:
+    image: dbeaver/cloudbeaver:latest
+    container_name: duckdb-ide
+    ports:
+      - "8978:8978"  # CHANGE PORT: modify left number (e.g., "8979:8978")
+    volumes:
+      - ./data:/opt/data  # Access to DuckDB files
+      - cloudbeaver-data:/opt/cloudbeaver/workspace
+    environment:
+      - CB_SERVER_NAME=OpenDataPlatform DuckDB IDE
+    restart: always
+
 volumes:
   postgres-db-volume:
   ollama-data:
+  cloudbeaver-data:
