@@ -190,8 +190,9 @@ def save_to_delta_lake(**context):
 
 
 def sync_to_duckdb(**context):
-    """Sync to DuckDB."""
+    """Sync to DuckDB with retry logic for database locks."""
     import duckdb
+    import time
 
     ti = context['ti']
     delta_info = ti.xcom_pull(task_ids='save_to_delta')
@@ -199,90 +200,129 @@ def sync_to_duckdb(**context):
     if not delta_info:
         return
 
-    conn = duckdb.connect(DUCKDB_PATH, read_only=False)
+    max_retries = 5
+    retry_delay = 2
 
-    try:
-        conn.execute("INSTALL delta;")
-        conn.execute("LOAD delta;")
-        conn.execute(f"""
-            CREATE OR REPLACE TABLE sec_filings AS
-            SELECT * FROM delta_scan('{DELTA_TABLE_PATH}')
-        """)
-    except:
-        conn.execute(f"""
-            CREATE OR REPLACE TABLE sec_filings AS
-            SELECT * FROM read_parquet('{DELTA_TABLE_PATH}/*.parquet')
-        """)
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-    count = conn.execute("SELECT COUNT(*) FROM sec_filings").fetchone()[0]
-    print(f"[DuckDB] Synced {count} filings")
+            try:
+                conn.execute("INSTALL delta;")
+                conn.execute("LOAD delta;")
+                conn.execute(f"""
+                    CREATE OR REPLACE TABLE sec_filings AS
+                    SELECT * FROM delta_scan('{DELTA_TABLE_PATH}')
+                """)
+            except:
+                conn.execute(f"""
+                    CREATE OR REPLACE TABLE sec_filings AS
+                    SELECT * FROM read_parquet('{DELTA_TABLE_PATH}/*.parquet')
+                """)
 
-    conn.close()
+            count = conn.execute("SELECT COUNT(*) FROM sec_filings").fetchone()[0]
+            print(f"[DuckDB] Synced {count} filings")
+
+            conn.close()
+            return count
+
+        except duckdb.IOException as e:
+            if "lock" in str(e).lower() and attempt < max_retries - 1:
+                print(f"[DuckDB] Database locked, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                if conn:
+                    conn.close()
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                if conn:
+                    conn.close()
+                raise
 
 
 def create_filing_views(**context):
-    """Create useful views for SEC filings analysis."""
+    """Create useful views for SEC filings analysis with retry logic."""
     import duckdb
+    import time
 
-    conn = duckdb.connect(DUCKDB_PATH, read_only=False)
+    max_retries = 5
+    retry_delay = 2
 
-    # Recent 10-K and 10-Q filings
-    conn.execute("""
-        CREATE OR REPLACE VIEW sec_annual_quarterly AS
-        SELECT
-            ticker,
-            company_name,
-            form_type,
-            filing_date,
-            filing_url
-        FROM sec_filings
-        WHERE form_type IN ('10-K', '10-Q')
-        ORDER BY filing_date DESC
-    """)
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-    # Material events (8-K filings)
-    conn.execute("""
-        CREATE OR REPLACE VIEW sec_material_events AS
-        SELECT
-            ticker,
-            company_name,
-            filing_date,
-            accession_number,
-            filing_url
-        FROM sec_filings
-        WHERE form_type = '8-K'
-        ORDER BY filing_date DESC
-    """)
+            # Recent 10-K and 10-Q filings
+            conn.execute("""
+                CREATE OR REPLACE VIEW sec_annual_quarterly AS
+                SELECT
+                    ticker,
+                    company_name,
+                    form_type,
+                    filing_date,
+                    filing_url
+                FROM sec_filings
+                WHERE form_type IN ('10-K', '10-Q')
+                ORDER BY filing_date DESC
+            """)
 
-    # Insider transactions (Form 4)
-    conn.execute("""
-        CREATE OR REPLACE VIEW sec_insider_trades AS
-        SELECT
-            ticker,
-            company_name,
-            filing_date,
-            filing_url
-        FROM sec_filings
-        WHERE form_type = '4'
-        ORDER BY filing_date DESC
-    """)
+            # Material events (8-K filings)
+            conn.execute("""
+                CREATE OR REPLACE VIEW sec_material_events AS
+                SELECT
+                    ticker,
+                    company_name,
+                    filing_date,
+                    accession_number,
+                    filing_url
+                FROM sec_filings
+                WHERE form_type = '8-K'
+                ORDER BY filing_date DESC
+            """)
 
-    # Filing counts by company
-    conn.execute("""
-        CREATE OR REPLACE VIEW sec_filing_summary AS
-        SELECT
-            ticker,
-            company_name,
-            form_type,
-            COUNT(*) as filing_count,
-            MAX(filing_date) as latest_filing
-        FROM sec_filings
-        GROUP BY ticker, company_name, form_type
-        ORDER BY ticker, form_type
-    """)
+            # Insider transactions (Form 4)
+            conn.execute("""
+                CREATE OR REPLACE VIEW sec_insider_trades AS
+                SELECT
+                    ticker,
+                    company_name,
+                    filing_date,
+                    filing_url
+                FROM sec_filings
+                WHERE form_type = '4'
+                ORDER BY filing_date DESC
+            """)
 
-    print("[DuckDB] Created views: sec_annual_quarterly, sec_material_events, sec_insider_trades, sec_filing_summary")
-    conn.close()
+            # Filing counts by company
+            conn.execute("""
+                CREATE OR REPLACE VIEW sec_filing_summary AS
+                SELECT
+                    ticker,
+                    company_name,
+                    form_type,
+                    COUNT(*) as filing_count,
+                    MAX(filing_date) as latest_filing
+                FROM sec_filings
+                GROUP BY ticker, company_name, form_type
+                ORDER BY ticker, form_type
+            """)
+
+            print("[DuckDB] Created views: sec_annual_quarterly, sec_material_events, sec_insider_trades, sec_filing_summary")
+            conn.close()
+            return
+
+        except duckdb.IOException as e:
+            if "lock" in str(e).lower() and attempt < max_retries - 1:
+                print(f"[DuckDB] Database locked, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                if conn:
+                    conn.close()
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                if conn:
+                    conn.close()
+                raise
 
 
 # DAG Definition

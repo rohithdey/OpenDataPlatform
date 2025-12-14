@@ -181,8 +181,9 @@ def save_to_delta_lake(**context):
 
 
 def sync_to_duckdb(**context):
-    """Sync Delta Lake table to DuckDB."""
+    """Sync Delta Lake table to DuckDB with retry logic."""
     import duckdb
+    import time
 
     ti = context['ti']
     delta_info = ti.xcom_pull(task_ids='save_to_delta')
@@ -192,85 +193,123 @@ def sync_to_duckdb(**context):
 
     print(f"[DuckDB] Syncing FRED data from Delta Lake")
 
-    conn = duckdb.connect(DUCKDB_PATH, read_only=False)
+    max_retries = 5
+    retry_delay = 2
 
-    try:
-        conn.execute("INSTALL delta;")
-        conn.execute("LOAD delta;")
-        conn.execute(f"""
-            CREATE OR REPLACE TABLE fred_economic AS
-            SELECT * FROM delta_scan('{DELTA_TABLE_PATH}')
-        """)
-    except Exception as e:
-        print(f"[DuckDB] Delta extension failed, using parquet: {e}")
-        conn.execute(f"""
-            CREATE OR REPLACE TABLE fred_economic AS
-            SELECT * FROM read_parquet('{DELTA_TABLE_PATH}/*.parquet')
-        """)
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-    count = conn.execute("SELECT COUNT(*) FROM fred_economic").fetchone()[0]
-    print(f"[DuckDB] Synced {count} records")
+            try:
+                conn.execute("INSTALL delta;")
+                conn.execute("LOAD delta;")
+                conn.execute(f"""
+                    CREATE OR REPLACE TABLE fred_economic AS
+                    SELECT * FROM delta_scan('{DELTA_TABLE_PATH}')
+                """)
+            except Exception as e:
+                print(f"[DuckDB] Delta extension failed, using parquet: {e}")
+                conn.execute(f"""
+                    CREATE OR REPLACE TABLE fred_economic AS
+                    SELECT * FROM read_parquet('{DELTA_TABLE_PATH}/*.parquet')
+                """)
 
-    conn.close()
-    return count
+            count = conn.execute("SELECT COUNT(*) FROM fred_economic").fetchone()[0]
+            print(f"[DuckDB] Synced {count} records")
+
+            conn.close()
+            return count
+
+        except duckdb.IOException as e:
+            if "lock" in str(e).lower() and attempt < max_retries - 1:
+                print(f"[DuckDB] Database locked, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                if conn:
+                    conn.close()
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                if conn:
+                    conn.close()
+                raise
 
 
 def create_economic_views(**context):
-    """Create useful views for economic analysis."""
+    """Create useful views for economic analysis with retry logic."""
     import duckdb
+    import time
 
-    conn = duckdb.connect(DUCKDB_PATH, read_only=False)
+    max_retries = 5
+    retry_delay = 2
 
-    # Latest values for each series
-    conn.execute("""
-        CREATE OR REPLACE VIEW fred_latest AS
-        SELECT
-            series_id,
-            date as latest_date,
-            value as latest_value
-        FROM fred_economic
-        WHERE (series_id, date) IN (
-            SELECT series_id, MAX(date)
-            FROM fred_economic
-            GROUP BY series_id
-        )
-    """)
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-    # Year-over-year change
-    conn.execute("""
-        CREATE OR REPLACE VIEW fred_yoy_change AS
-        SELECT
-            a.series_id,
-            a.date,
-            a.value as current_value,
-            b.value as year_ago_value,
-            ROUND((a.value - b.value) / NULLIF(b.value, 0) * 100, 2) as yoy_change_pct
-        FROM fred_economic a
-        LEFT JOIN fred_economic b
-            ON a.series_id = b.series_id
-            AND b.date = a.date - INTERVAL '1 year'
-        WHERE b.value IS NOT NULL
-        ORDER BY a.series_id, a.date DESC
-    """)
+            # Latest values for each series
+            conn.execute("""
+                CREATE OR REPLACE VIEW fred_latest AS
+                SELECT
+                    series_id,
+                    date as latest_date,
+                    value as latest_value
+                FROM fred_economic
+                WHERE (series_id, date) IN (
+                    SELECT series_id, MAX(date)
+                    FROM fred_economic
+                    GROUP BY series_id
+                )
+            """)
 
-    # Treasury yield spread (10Y - 2Y, indicator of recession)
-    conn.execute("""
-        CREATE OR REPLACE VIEW treasury_yield_spread AS
-        SELECT
-            a.date,
-            a.value as yield_10y,
-            b.value as yield_2y,
-            ROUND(a.value - b.value, 2) as spread_10y_2y
-        FROM fred_economic a
-        JOIN fred_economic b
-            ON a.date = b.date
-            AND a.series_id = 'DGS10'
-            AND b.series_id = 'DGS2'
-        ORDER BY a.date DESC
-    """)
+            # Year-over-year change
+            conn.execute("""
+                CREATE OR REPLACE VIEW fred_yoy_change AS
+                SELECT
+                    a.series_id,
+                    a.date,
+                    a.value as current_value,
+                    b.value as year_ago_value,
+                    ROUND((a.value - b.value) / NULLIF(b.value, 0) * 100, 2) as yoy_change_pct
+                FROM fred_economic a
+                LEFT JOIN fred_economic b
+                    ON a.series_id = b.series_id
+                    AND b.date = a.date - INTERVAL '1 year'
+                WHERE b.value IS NOT NULL
+                ORDER BY a.series_id, a.date DESC
+            """)
 
-    print("[DuckDB] Created views: fred_latest, fred_yoy_change, treasury_yield_spread")
-    conn.close()
+            # Treasury yield spread (10Y - 2Y, indicator of recession)
+            conn.execute("""
+                CREATE OR REPLACE VIEW treasury_yield_spread AS
+                SELECT
+                    a.date,
+                    a.value as yield_10y,
+                    b.value as yield_2y,
+                    ROUND(a.value - b.value, 2) as spread_10y_2y
+                FROM fred_economic a
+                JOIN fred_economic b
+                    ON a.date = b.date
+                    AND a.series_id = 'DGS10'
+                    AND b.series_id = 'DGS2'
+                ORDER BY a.date DESC
+            """)
+
+            print("[DuckDB] Created views: fred_latest, fred_yoy_change, treasury_yield_spread")
+            conn.close()
+            return
+
+        except duckdb.IOException as e:
+            if "lock" in str(e).lower() and attempt < max_retries - 1:
+                print(f"[DuckDB] Database locked, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                if conn:
+                    conn.close()
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                if conn:
+                    conn.close()
+                raise
 
 
 # DAG Definition

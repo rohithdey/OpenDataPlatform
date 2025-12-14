@@ -290,136 +290,176 @@ def save_ohlc_to_delta(**context):
 
 
 def sync_to_duckdb(**context):
-    """Sync to DuckDB."""
+    """Sync to DuckDB with retry logic for database locks."""
     import duckdb
+    import time
 
-    conn = duckdb.connect(DUCKDB_PATH, read_only=False)
+    max_retries = 5
+    retry_delay = 2
 
-    # Sync main crypto prices
-    try:
-        conn.execute("INSTALL delta;")
-        conn.execute("LOAD delta;")
-        conn.execute(f"""
-            CREATE OR REPLACE TABLE crypto_prices AS
-            SELECT * FROM delta_scan('{DELTA_TABLE_PATH}')
-        """)
-    except:
-        conn.execute(f"""
-            CREATE OR REPLACE TABLE crypto_prices AS
-            SELECT * FROM read_parquet('{DELTA_TABLE_PATH}/*.parquet')
-        """)
-
-    count = conn.execute("SELECT COUNT(*) FROM crypto_prices").fetchone()[0]
-    print(f"[DuckDB] Synced {count} crypto price records")
-
-    # Try to sync OHLC data if it exists
-    ohlc_path = '/opt/airflow/data/delta/crypto_ohlc'
-    if os.path.exists(ohlc_path):
+    for attempt in range(max_retries):
+        conn = None
         try:
-            conn.execute(f"""
-                CREATE OR REPLACE TABLE crypto_ohlc AS
-                SELECT * FROM delta_scan('{ohlc_path}')
-            """)
-            ohlc_count = conn.execute("SELECT COUNT(*) FROM crypto_ohlc").fetchone()[0]
-            print(f"[DuckDB] Synced {ohlc_count} OHLC records")
-        except:
-            pass
+            conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-    conn.close()
+            # Sync main crypto prices
+            try:
+                conn.execute("INSTALL delta;")
+                conn.execute("LOAD delta;")
+                conn.execute(f"""
+                    CREATE OR REPLACE TABLE crypto_prices AS
+                    SELECT * FROM delta_scan('{DELTA_TABLE_PATH}')
+                """)
+            except:
+                conn.execute(f"""
+                    CREATE OR REPLACE TABLE crypto_prices AS
+                    SELECT * FROM read_parquet('{DELTA_TABLE_PATH}/*.parquet')
+                """)
+
+            count = conn.execute("SELECT COUNT(*) FROM crypto_prices").fetchone()[0]
+            print(f"[DuckDB] Synced {count} crypto price records")
+
+            # Try to sync OHLC data if it exists
+            ohlc_path = '/opt/airflow/data/delta/crypto_ohlc'
+            if os.path.exists(ohlc_path):
+                try:
+                    conn.execute(f"""
+                        CREATE OR REPLACE TABLE crypto_ohlc AS
+                        SELECT * FROM delta_scan('{ohlc_path}')
+                    """)
+                    ohlc_count = conn.execute("SELECT COUNT(*) FROM crypto_ohlc").fetchone()[0]
+                    print(f"[DuckDB] Synced {ohlc_count} OHLC records")
+                except:
+                    pass
+
+            conn.close()
+            return count
+
+        except duckdb.IOException as e:
+            if "lock" in str(e).lower() and attempt < max_retries - 1:
+                print(f"[DuckDB] Database locked, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                if conn:
+                    conn.close()
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                if conn:
+                    conn.close()
+                raise
 
 
 def create_crypto_views(**context):
-    """Create useful views for crypto analysis."""
+    """Create useful views for crypto analysis with retry logic."""
     import duckdb
+    import time
 
-    conn = duckdb.connect(DUCKDB_PATH, read_only=False)
+    max_retries = 5
+    retry_delay = 2
 
-    # Latest prices with rankings
-    conn.execute("""
-        CREATE OR REPLACE VIEW crypto_latest AS
-        SELECT
-            symbol,
-            name,
-            current_price,
-            market_cap,
-            market_cap_rank,
-            total_volume,
-            price_change_pct_24h,
-            price_change_pct_7d,
-            ath,
-            ath_change_pct,
-            fetch_date
-        FROM crypto_prices
-        WHERE (symbol, fetch_timestamp) IN (
-            SELECT symbol, MAX(fetch_timestamp)
-            FROM crypto_prices
-            GROUP BY symbol
-        )
-        ORDER BY market_cap_rank
-    """)
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = duckdb.connect(DUCKDB_PATH, read_only=False)
 
-    # Top gainers/losers
-    conn.execute("""
-        CREATE OR REPLACE VIEW crypto_movers AS
-        SELECT
-            symbol,
-            name,
-            current_price,
-            price_change_pct_24h,
-            price_change_pct_7d,
-            CASE
-                WHEN price_change_pct_24h > 0 THEN 'gainer'
-                ELSE 'loser'
-            END as direction
-        FROM crypto_prices
-        WHERE (symbol, fetch_timestamp) IN (
-            SELECT symbol, MAX(fetch_timestamp)
-            FROM crypto_prices
-            GROUP BY symbol
-        )
-        ORDER BY ABS(price_change_pct_24h) DESC
-    """)
+            # Latest prices with rankings
+            conn.execute("""
+                CREATE OR REPLACE VIEW crypto_latest AS
+                SELECT
+                    symbol,
+                    name,
+                    current_price,
+                    market_cap,
+                    market_cap_rank,
+                    total_volume,
+                    price_change_pct_24h,
+                    price_change_pct_7d,
+                    ath,
+                    ath_change_pct,
+                    fetch_date
+                FROM crypto_prices
+                WHERE (symbol, fetch_timestamp) IN (
+                    SELECT symbol, MAX(fetch_timestamp)
+                    FROM crypto_prices
+                    GROUP BY symbol
+                )
+                ORDER BY market_cap_rank
+            """)
 
-    # Distance from ATH
-    conn.execute("""
-        CREATE OR REPLACE VIEW crypto_ath_distance AS
-        SELECT
-            symbol,
-            name,
-            current_price,
-            ath,
-            ROUND(ath_change_pct, 2) as pct_from_ath,
-            ath_date
-        FROM crypto_prices
-        WHERE (symbol, fetch_timestamp) IN (
-            SELECT symbol, MAX(fetch_timestamp)
-            FROM crypto_prices
-            GROUP BY symbol
-        )
-        ORDER BY ath_change_pct DESC
-    """)
+            # Top gainers/losers
+            conn.execute("""
+                CREATE OR REPLACE VIEW crypto_movers AS
+                SELECT
+                    symbol,
+                    name,
+                    current_price,
+                    price_change_pct_24h,
+                    price_change_pct_7d,
+                    CASE
+                        WHEN price_change_pct_24h > 0 THEN 'gainer'
+                        ELSE 'loser'
+                    END as direction
+                FROM crypto_prices
+                WHERE (symbol, fetch_timestamp) IN (
+                    SELECT symbol, MAX(fetch_timestamp)
+                    FROM crypto_prices
+                    GROUP BY symbol
+                )
+                ORDER BY ABS(price_change_pct_24h) DESC
+            """)
 
-    # Market summary
-    conn.execute("""
-        CREATE OR REPLACE VIEW crypto_market_summary AS
-        SELECT
-            fetch_date,
-            COUNT(DISTINCT symbol) as coins_tracked,
-            SUM(market_cap) as total_market_cap,
-            SUM(total_volume) as total_volume_24h,
-            AVG(price_change_pct_24h) as avg_24h_change
-        FROM crypto_prices
-        WHERE (symbol, fetch_timestamp) IN (
-            SELECT symbol, MAX(fetch_timestamp)
-            FROM crypto_prices
-            GROUP BY symbol
-        )
-        GROUP BY fetch_date
-        ORDER BY fetch_date DESC
-    """)
+            # Distance from ATH
+            conn.execute("""
+                CREATE OR REPLACE VIEW crypto_ath_distance AS
+                SELECT
+                    symbol,
+                    name,
+                    current_price,
+                    ath,
+                    ROUND(ath_change_pct, 2) as pct_from_ath,
+                    ath_date
+                FROM crypto_prices
+                WHERE (symbol, fetch_timestamp) IN (
+                    SELECT symbol, MAX(fetch_timestamp)
+                    FROM crypto_prices
+                    GROUP BY symbol
+                )
+                ORDER BY ath_change_pct DESC
+            """)
 
-    print("[DuckDB] Created views: crypto_latest, crypto_movers, crypto_ath_distance, crypto_market_summary")
-    conn.close()
+            # Market summary
+            conn.execute("""
+                CREATE OR REPLACE VIEW crypto_market_summary AS
+                SELECT
+                    fetch_date,
+                    COUNT(DISTINCT symbol) as coins_tracked,
+                    SUM(market_cap) as total_market_cap,
+                    SUM(total_volume) as total_volume_24h,
+                    AVG(price_change_pct_24h) as avg_24h_change
+                FROM crypto_prices
+                WHERE (symbol, fetch_timestamp) IN (
+                    SELECT symbol, MAX(fetch_timestamp)
+                    FROM crypto_prices
+                    GROUP BY symbol
+                )
+                GROUP BY fetch_date
+                ORDER BY fetch_date DESC
+            """)
+
+            print("[DuckDB] Created views: crypto_latest, crypto_movers, crypto_ath_distance, crypto_market_summary")
+            conn.close()
+            return
+
+        except duckdb.IOException as e:
+            if "lock" in str(e).lower() and attempt < max_retries - 1:
+                print(f"[DuckDB] Database locked, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                if conn:
+                    conn.close()
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                if conn:
+                    conn.close()
+                raise
 
 
 # DAG Definition
