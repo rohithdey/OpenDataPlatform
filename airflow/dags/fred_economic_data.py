@@ -131,6 +131,8 @@ def fetch_fred_data(**context):
 def save_to_delta_lake(**context):
     """Save FRED data to Delta Lake with ACID transactions."""
     from deltalake import write_deltalake, DeltaTable
+    import pyarrow as pa
+    from io import StringIO
 
     ti = context['ti']
     json_data = ti.xcom_pull(task_ids='fetch_fred_data')
@@ -138,7 +140,7 @@ def save_to_delta_lake(**context):
     if not json_data:
         raise ValueError("No data received from fetch task")
 
-    df = pd.read_json(json_data, orient='records')
+    df = pd.read_json(StringIO(json_data), orient='records')
     print(f"[Delta Lake] Processing {len(df)} records")
 
     os.makedirs(os.path.dirname(DELTA_TABLE_PATH), exist_ok=True)
@@ -146,13 +148,16 @@ def save_to_delta_lake(**context):
     df['ingestion_date'] = datetime.now().date()
     df['date'] = pd.to_datetime(df['date'])
 
+    # Convert to PyArrow Table for Delta Lake compatibility
+    table = pa.Table.from_pandas(df)
+
     try:
         delta_log_path = os.path.join(DELTA_TABLE_PATH, '_delta_log')
         if os.path.exists(DELTA_TABLE_PATH) and os.path.exists(delta_log_path):
             print("[Delta Lake] Appending to existing table...")
             write_deltalake(
                 DELTA_TABLE_PATH,
-                df,
+                table,
                 mode="append",
                 schema_mode="merge"
             )
@@ -160,7 +165,7 @@ def save_to_delta_lake(**context):
             print("[Delta Lake] Creating new Delta table...")
             write_deltalake(
                 DELTA_TABLE_PATH,
-                df,
+                table,
                 mode="overwrite",
                 partition_by=["series_id"]
             )

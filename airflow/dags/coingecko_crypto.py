@@ -211,6 +211,8 @@ def fetch_historical_prices(**context):
 def save_to_delta_lake(**context):
     """Save crypto data to Delta Lake."""
     from deltalake import write_deltalake, DeltaTable
+    import pyarrow as pa
+    from io import StringIO
 
     ti = context['ti']
     json_data = ti.xcom_pull(task_ids='fetch_coingecko_data')
@@ -218,7 +220,7 @@ def save_to_delta_lake(**context):
     if not json_data:
         raise ValueError("No data received from fetch task")
 
-    df = pd.read_json(json_data, orient='records')
+    df = pd.read_json(StringIO(json_data), orient='records')
     print(f"[Delta Lake] Processing {len(df)} records")
 
     os.makedirs(os.path.dirname(DELTA_TABLE_PATH), exist_ok=True)
@@ -230,12 +232,15 @@ def save_to_delta_lake(**context):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
 
+    # Convert to PyArrow Table for Delta Lake compatibility
+    table = pa.Table.from_pandas(df)
+
     try:
         delta_log_path = os.path.join(DELTA_TABLE_PATH, '_delta_log')
         if os.path.exists(DELTA_TABLE_PATH) and os.path.exists(delta_log_path):
-            write_deltalake(DELTA_TABLE_PATH, df, mode="append", schema_mode="merge")
+            write_deltalake(DELTA_TABLE_PATH, table, mode="append", schema_mode="merge")
         else:
-            write_deltalake(DELTA_TABLE_PATH, df, mode="overwrite", partition_by=["symbol"])
+            write_deltalake(DELTA_TABLE_PATH, table, mode="overwrite", partition_by=["symbol"])
 
         dt = DeltaTable(DELTA_TABLE_PATH)
         print(f"[Delta Lake] Saved. Version: {dt.version()}")
@@ -250,6 +255,8 @@ def save_to_delta_lake(**context):
 def save_ohlc_to_delta(**context):
     """Save OHLC historical data to separate Delta table."""
     from deltalake import write_deltalake, DeltaTable
+    import pyarrow as pa
+    from io import StringIO
 
     ti = context['ti']
     json_data = ti.xcom_pull(task_ids='fetch_historical_prices')
@@ -258,19 +265,22 @@ def save_ohlc_to_delta(**context):
         print("[Delta Lake] No OHLC data to save")
         return
 
-    df = pd.read_json(json_data, orient='records')
+    df = pd.read_json(StringIO(json_data), orient='records')
     ohlc_path = '/opt/airflow/data/delta/crypto_ohlc'
 
     os.makedirs(os.path.dirname(ohlc_path), exist_ok=True)
 
     df['timestamp'] = pd.to_datetime(df['timestamp'])
 
+    # Convert to PyArrow Table for Delta Lake compatibility
+    table = pa.Table.from_pandas(df)
+
     try:
         delta_log_path = os.path.join(ohlc_path, '_delta_log')
         if os.path.exists(ohlc_path) and os.path.exists(delta_log_path):
-            write_deltalake(ohlc_path, df, mode="append", schema_mode="merge")
+            write_deltalake(ohlc_path, table, mode="append", schema_mode="merge")
         else:
-            write_deltalake(ohlc_path, df, mode="overwrite", partition_by=["coin_id"])
+            write_deltalake(ohlc_path, table, mode="overwrite", partition_by=["coin_id"])
 
         dt = DeltaTable(ohlc_path)
         print(f"[Delta Lake] OHLC saved. Version: {dt.version()}")

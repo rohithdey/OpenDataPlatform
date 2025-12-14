@@ -150,6 +150,8 @@ def fetch_sec_filings(**context):
 def save_to_delta_lake(**context):
     """Save SEC filings to Delta Lake."""
     from deltalake import write_deltalake, DeltaTable
+    import pyarrow as pa
+    from io import StringIO
 
     ti = context['ti']
     json_data = ti.xcom_pull(task_ids='fetch_sec_filings')
@@ -157,7 +159,8 @@ def save_to_delta_lake(**context):
     if not json_data:
         raise ValueError("No data received from fetch task")
 
-    df = pd.read_json(json_data, orient='records')
+    # Fix FutureWarning by wrapping in StringIO
+    df = pd.read_json(StringIO(json_data), orient='records')
     print(f"[Delta Lake] Processing {len(df)} filings")
 
     os.makedirs(os.path.dirname(DELTA_TABLE_PATH), exist_ok=True)
@@ -166,12 +169,15 @@ def save_to_delta_lake(**context):
     if 'filing_date' in df.columns:
         df['filing_date'] = pd.to_datetime(df['filing_date'])
 
+    # Convert to PyArrow Table for Delta Lake compatibility
+    table = pa.Table.from_pandas(df)
+
     try:
         delta_log_path = os.path.join(DELTA_TABLE_PATH, '_delta_log')
         if os.path.exists(DELTA_TABLE_PATH) and os.path.exists(delta_log_path):
-            write_deltalake(DELTA_TABLE_PATH, df, mode="append", schema_mode="merge")
+            write_deltalake(DELTA_TABLE_PATH, table, mode="append", schema_mode="merge")
         else:
-            write_deltalake(DELTA_TABLE_PATH, df, mode="overwrite", partition_by=["ticker"])
+            write_deltalake(DELTA_TABLE_PATH, table, mode="overwrite", partition_by=["ticker"])
 
         dt = DeltaTable(DELTA_TABLE_PATH)
         print(f"[Delta Lake] Saved. Version: {dt.version()}")

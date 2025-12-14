@@ -167,6 +167,8 @@ def save_to_delta_lake(**context):
     - Audit history
     """
     from deltalake import write_deltalake, DeltaTable
+    import pyarrow as pa
+    from io import StringIO
 
     ti = context['ti']
     json_data = ti.xcom_pull(task_ids='fetch_yahoo_data')
@@ -174,7 +176,8 @@ def save_to_delta_lake(**context):
     if not json_data:
         raise ValueError("No data received from fetch task")
 
-    df = pd.read_json(json_data, orient='records')
+    # Fix FutureWarning by wrapping in StringIO
+    df = pd.read_json(StringIO(json_data), orient='records')
     print(f"[Delta Lake] Processing {len(df)} records")
 
     # Ensure directory exists
@@ -188,6 +191,9 @@ def save_to_delta_lake(**context):
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'])
 
+    # Convert to PyArrow Table for Delta Lake compatibility
+    table = pa.Table.from_pandas(df)
+
     # Write to Delta Lake with ACID transaction
     # mode="append" adds new data
     # mode="overwrite" replaces all data
@@ -197,7 +203,7 @@ def save_to_delta_lake(**context):
             print("[Delta Lake] Appending to existing table...")
             write_deltalake(
                 DELTA_TABLE_PATH,
-                df,
+                table,
                 mode="append",
                 schema_mode="merge"  # Allow schema evolution
             )
@@ -206,7 +212,7 @@ def save_to_delta_lake(**context):
             print("[Delta Lake] Creating new Delta table...")
             write_deltalake(
                 DELTA_TABLE_PATH,
-                df,
+                table,
                 mode="overwrite",
                 partition_by=["symbol"]  # Partition by symbol for faster queries
             )
