@@ -5,10 +5,24 @@
 | Service | Port | URL |
 |---------|------|-----|
 | UI | 3000 | http://localhost:3000 |
-| API | 8000 | http://localhost:8000 |
+| API | 8000 | http://localhost:8000/docs |
 | Airflow | 8080 | http://localhost:8080 (admin/admin) |
 | DuckDB IDE | 8978 | http://localhost:8978 |
 | Ollama | 11434 | http://localhost:11434 |
+
+---
+
+## DuckDB IDE Setup (CloudBeaver)
+
+First time only - after starting containers:
+
+1. Open http://localhost:8978
+2. Click **"Configure"** → Set admin username/password
+3. Click **"+"** → Search **"DuckDB"** → Select it
+4. Set **Database Path**: `/opt/data/warehouse.duckdb`
+5. Click **"Test Connection"** → **"Create"**
+
+See `cloudbeaver/SETUP.md` for detailed instructions.
 
 ---
 
