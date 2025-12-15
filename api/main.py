@@ -68,9 +68,23 @@ class TableInfo(BaseModel):
 # Database connection helper
 def get_db_connection(read_only=True):
     """Get DuckDB connection - uses read_only by default to avoid locks"""
-    conn = duckdb.connect(DUCKDB_PATH, read_only=read_only)
-    # Note: Iceberg extension removed - not needed and causes issues on ARM Macs
-    return conn
+    import time
+    max_retries = 3
+    retry_delay = 1
+
+    for attempt in range(max_retries):
+        try:
+            conn = duckdb.connect(DUCKDB_PATH, read_only=read_only)
+            return conn
+        except duckdb.IOException as e:
+            if "lock" in str(e).lower() and attempt < max_retries - 1:
+                print(f"[DuckDB] Lock detected, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                raise
+
+    raise Exception("Could not connect to DuckDB after retries")
 
 # Vector store for semantic search
 class VectorStore:
@@ -1548,6 +1562,119 @@ async def vacuum_delta_table(table_name: str, retention_hours: int = 168):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== Lock-Free Query Endpoint ==============
+
+class DeltaSQLQuery(BaseModel):
+    query: str
+
+@app.post("/query/live")
+async def execute_live_query(query_request: DeltaSQLQuery):
+    """
+    Execute SQL query directly against Delta Lake tables - NEVER BLOCKS.
+
+    This endpoint bypasses the DuckDB warehouse file entirely, querying
+    Delta Lake parquet files directly using an in-memory DuckDB instance.
+
+    Use this when DAGs are running and you need guaranteed query access.
+
+    Available tables (use delta_scan):
+    - delta_scan('/app/data/delta/stock_prices')
+    - delta_scan('/app/data/delta/sec_filings')
+    - delta_scan('/app/data/delta/fred_economic')
+    - delta_scan('/app/data/delta/crypto_prices')
+
+    Example queries:
+    - SELECT * FROM delta_scan('/app/data/delta/stock_prices') LIMIT 100
+    - SELECT symbol, AVG(close) as avg_close FROM delta_scan('/app/data/delta/stock_prices') GROUP BY symbol
+    """
+    try:
+        # Use in-memory DuckDB - no file locks!
+        conn = duckdb.connect(':memory:')
+
+        # Install and load delta extension
+        conn.execute("INSTALL delta;")
+        conn.execute("LOAD delta;")
+
+        query = query_request.query.strip()
+
+        # Execute the query
+        df = conn.execute(query).fetchdf()
+
+        conn.close()
+
+        return {
+            "data": json.loads(df.to_json(orient='records', date_format='iso')),
+            "columns": list(df.columns),
+            "row_count": len(df),
+            "source": "delta_lake_live",
+            "lock_free": True
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/query/live/{table_name}")
+async def query_live_table(
+    table_name: str,
+    columns: Optional[str] = None,
+    where: Optional[str] = None,
+    order_by: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    Simple lock-free query against a Delta Lake table.
+
+    Args:
+        table_name: Name of Delta table (stock_prices, sec_filings, fred_economic, crypto_prices)
+        columns: Comma-separated columns to select (default: all)
+        where: WHERE clause condition (e.g., "symbol = 'AAPL'")
+        order_by: ORDER BY clause (e.g., "date DESC")
+        limit: Max rows to return (default: 100)
+
+    Examples:
+        /query/live/stock_prices?columns=symbol,date,close&where=symbol='AAPL'&limit=50
+        /query/live/sec_filings?order_by=filing_date DESC&limit=20
+    """
+    try:
+        delta_path = f"/app/data/delta/{table_name}"
+
+        if not os.path.exists(delta_path):
+            raise HTTPException(status_code=404, detail=f"Table {table_name} not found")
+
+        # Build query
+        select_cols = columns if columns else "*"
+        query = f"SELECT {select_cols} FROM delta_scan('{delta_path}')"
+
+        if where:
+            query += f" WHERE {where}"
+        if order_by:
+            query += f" ORDER BY {order_by}"
+        query += f" LIMIT {limit}"
+
+        # Use in-memory DuckDB - no file locks!
+        conn = duckdb.connect(':memory:')
+        conn.execute("INSTALL delta;")
+        conn.execute("LOAD delta;")
+
+        df = conn.execute(query).fetchdf()
+        conn.close()
+
+        return {
+            "table": table_name,
+            "data": json.loads(df.to_json(orient='records', date_format='iso')),
+            "columns": list(df.columns),
+            "row_count": len(df),
+            "query": query,
+            "lock_free": True
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # Legacy Iceberg endpoints (redirect to Delta)
