@@ -2073,6 +2073,7 @@ async def list_dbt_models():
                             "path": f"models/{layer}/{f}"
                         })
 
+        # Summarize the project context so the client can display totals
         return {
             "project_dir": DBT_PROJECT_DIR,
             "models": models,
@@ -2094,6 +2095,7 @@ async def get_dbt_model(model_name: str):
                 # Read the file into memory for immediate preview in the UI
                 with open(model_path, 'r') as f:
                     content = f.read()
+                # Return the resolved layer for clarity in the UI
                 return {
                     "model": model_name,
                     "layer": layer,
@@ -2144,6 +2146,7 @@ async def run_dbt(
             timeout=300
         )
 
+        # Return command metadata so callers can replay the exact invocation
         return {
             "success": result.returncode == 0,
             "command": " ".join(cmd),
@@ -2178,6 +2181,7 @@ async def run_dbt_tests(selector: Optional[str] = None):
             timeout=120
         )
 
+        # Return the command and output so the client can render detailed logs
         return {
             "success": result.returncode == 0,
             "command": " ".join(cmd),
@@ -2209,6 +2213,7 @@ async def get_dbt_docs():
             # Load the manifest and surface a small sample to keep responses lightweight
             with open(manifest_path, 'r') as f:
                 manifest = json.load(f)
+                # Expose the first few model and source identifiers for quick inspection
                 result["models"] = list(manifest.get("nodes", {}).keys())[:20]  # First 20 nodes
                 result["sources"] = list(manifest.get("sources", {}).keys())
 
@@ -2225,6 +2230,7 @@ async def get_model_lineage(model_name: str):
         manifest_path = os.path.join(DBT_PROJECT_DIR, "target", "manifest.json")
 
         if not os.path.exists(manifest_path):
+            # Provide a helpful message instead of raising so the UI can display guidance
             return {
                 "message": "Run 'dbt docs generate' first to build lineage",
                 "model": model_name
