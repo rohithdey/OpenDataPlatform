@@ -521,45 +521,6 @@ with DAG(
 '''
     return dag_code
 
-# ============== DBT Integration Endpoints ==============
-
-@app.get("/dbt/models")
-async def list_dbt_models():
-    """List DBT models"""
-    try:
-        models_path = Path("/app/dbt/models")
-        if not models_path.exists():
-            return {"models": []}
-        
-        models = []
-        for sql_file in models_path.glob("**/*.sql"):
-            models.append({
-                "name": sql_file.stem,
-                "path": str(sql_file.relative_to(models_path))
-            })
-        
-        return {"models": models}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/dbt/models/{model_name}")
-async def get_dbt_model(model_name: str):
-    """Get DBT model content"""
-    try:
-        models_path = Path("/app/dbt/models")
-        
-        # Search for the model
-        for sql_file in models_path.glob(f"**/{model_name}.sql"):
-            with open(sql_file, 'r') as f:
-                content = f.read()
-            return {"name": model_name, "content": content}
-        
-        raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 # ============== Yahoo Finance Endpoints ==============
 
 class YahooFinanceConfig(BaseModel):
@@ -579,8 +540,8 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 
 def detect_ollama_host():
     """Detect Ollama host - handles Docker vs local development"""
-    import platform
-
+    # Build an ordered list of candidate hosts so we can try Docker service
+    # DNS first and fall back to loopback addresses that work on both Mac and Linux.
     # Try docker service name first (for containerized deployment)
     hosts_to_try = [
         os.getenv("OLLAMA_URL", "http://ollama:11434"),
@@ -591,8 +552,10 @@ def detect_ollama_host():
 
     for host in hosts_to_try:
         try:
+            # Issue a lightweight tag listing request to confirm connectivity
             response = requests.get(f"{host}/api/tags", timeout=2)
             if response.status_code == 200:
+                # Return the first reachable host so API calls can reuse it
                 print(f"[Ollama] Connected to {host}")
                 return host
         except:
@@ -1887,32 +1850,6 @@ async def create_dbt_model(request: DBTTransformRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/dbt/run")
-async def run_dbt():
-    """Trigger DBT run (requires dbt to be installed in container)."""
-    try:
-        import subprocess
-
-        result = subprocess.run(
-            ["dbt", "run", "--project-dir", "/app/dbt"],
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-
-        return {
-            "success": result.returncode == 0,
-            "stdout": result.stdout,
-            "stderr": result.stderr
-        }
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="DBT run timed out")
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="DBT not installed in container")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 # ============== AI Query Endpoints (Ollama Integration) ==============
 
 @app.post("/ai/sql")
@@ -2115,6 +2052,8 @@ DBT_PROJECT_DIR = "/app/dbt"
 async def list_dbt_models():
     """List all DBT models organized by layer."""
     try:
+        # Pre-seed canonical DBT folder names so the response structure is stable
+        # even when a layer folder is empty or missing.
         models = {
             "staging": [],
             "intermediate": [],
@@ -2122,8 +2061,10 @@ async def list_dbt_models():
         }
 
         for layer in models.keys():
+            # Build the absolute path for each layer (e.g., /app/dbt/models/staging)
             layer_dir = os.path.join(DBT_PROJECT_DIR, "models", layer)
             if os.path.exists(layer_dir):
+                # Enumerate SQL files in the layer directory so the UI can link to them
                 for f in os.listdir(layer_dir):
                     if f.endswith('.sql'):
                         model_name = f.replace('.sql', '')
@@ -2146,10 +2087,11 @@ async def list_dbt_models():
 async def get_dbt_model(model_name: str):
     """Get the SQL content of a specific DBT model."""
     try:
-        # Search in all layers
+        # Search in all known layers so callers do not have to provide the folder name
         for layer in ['staging', 'intermediate', 'marts']:
             model_path = os.path.join(DBT_PROJECT_DIR, "models", layer, f"{model_name}.sql")
             if os.path.exists(model_path):
+                # Read the file into memory for immediate preview in the UI
                 with open(model_path, 'r') as f:
                     content = f.read()
                 return {
@@ -2182,14 +2124,19 @@ async def run_dbt(
     import subprocess
 
     try:
+        # Assemble the dbt CLI command with explicit project and profile directories
+        # so the API works the same way inside and outside Docker.
         cmd = ["dbt", "run", "--project-dir", DBT_PROJECT_DIR, "--profiles-dir", DBT_PROJECT_DIR]
 
         if selector:
+            # Narrow execution to a specific selection (tag, model, folder, etc.)
             cmd.extend(["--select", selector])
 
         if full_refresh:
+            # Force rebuild of incremental models when the user asks for it
             cmd.append("--full-refresh")
 
+        # Run the command and capture both stdout and stderr for debugging in the UI
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -2216,11 +2163,14 @@ async def run_dbt_tests(selector: Optional[str] = None):
     import subprocess
 
     try:
+        # Build the dbt test command so it uses the same profile as dbt run
         cmd = ["dbt", "test", "--project-dir", DBT_PROJECT_DIR, "--profiles-dir", DBT_PROJECT_DIR]
 
         if selector:
+            # Allow targeted testing for faster feedback loops
             cmd.extend(["--select", selector])
 
+        # Execute and capture logs for surfacing in the UI/API response
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -2248,6 +2198,7 @@ async def get_dbt_docs():
         catalog_path = os.path.join(DBT_PROJECT_DIR, "target", "catalog.json")
         manifest_path = os.path.join(DBT_PROJECT_DIR, "target", "manifest.json")
 
+        # Report basic availability so the UI can show actionable status
         result = {
             "catalog_exists": os.path.exists(catalog_path),
             "manifest_exists": os.path.exists(manifest_path),
@@ -2255,6 +2206,7 @@ async def get_dbt_docs():
 
         if os.path.exists(manifest_path):
             import json
+            # Load the manifest and surface a small sample to keep responses lightweight
             with open(manifest_path, 'r') as f:
                 manifest = json.load(f)
                 result["models"] = list(manifest.get("nodes", {}).keys())[:20]  # First 20 nodes
@@ -2279,6 +2231,7 @@ async def get_model_lineage(model_name: str):
             }
 
         import json
+        # Load the manifest to inspect dependency graph nodes
         with open(manifest_path, 'r') as f:
             manifest = json.load(f)
 
@@ -2286,6 +2239,8 @@ async def get_model_lineage(model_name: str):
         nodes = manifest.get("nodes", {})
         model_key = None
         for key in nodes.keys():
+            # DBT keys look like 'model.project_name.model_name' so we
+            # perform substring matching to handle namespaced identifiers.
             if model_name in key:
                 model_key = key
                 break
