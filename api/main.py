@@ -814,13 +814,43 @@ async def save_yahoo_finance_data(config: YahooFinanceConfig):
             print(f"[Delta Lake] Error or missing deps, falling back to DuckDB only: {e}")
             conn_fallback = get_db_connection(read_only=False)
             conn_fallback.register("yf_df", df)
+
+            # Create table if it does not exist yet
             conn_fallback.execute("""
                 CREATE TABLE IF NOT EXISTS stock_prices AS
-                SELECT * FROM yf_df WHERE 1=0
-            """)
-            conn_fallback.execute("""
-                INSERT INTO stock_prices
                 SELECT * FROM yf_df
+            """)
+
+            # Align columns to existing schema to avoid binder errors when schemas diverge
+            existing_cols = [
+                row[0]
+                for row in conn_fallback.execute("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'stock_prices'
+                    ORDER BY ordinal_position
+                """).fetchall()
+            ]
+            df_cols = list(df.columns)
+
+            insert_cols = []
+            select_parts = []
+
+            for col in existing_cols:
+                insert_cols.append(f'"{col}"')
+                if col in df_cols:
+                    select_parts.append(f'"{col}"')
+                elif col == "ingestion_date":
+                    select_parts.append("CURRENT_DATE")
+                elif col in ["ingestion_timestamp", "fetch_timestamp"]:
+                    select_parts.append(f"'{datetime.now().isoformat()}'")
+                else:
+                    select_parts.append("NULL")
+
+            conn_fallback.execute(f"""
+                INSERT INTO stock_prices ({', '.join(insert_cols)})
+                SELECT {', '.join(select_parts)}
+                FROM yf_df
             """)
             conn_fallback.close()
 
