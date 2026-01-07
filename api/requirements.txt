@@ -16,7 +16,8 @@ dbt-duckdb>=1.7.0
 aiofiles==23.2.1
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-yfinance>=0.2.43
+# yfinance pins need to remain Python 3.9-compatible for host test runners
+yfinance==0.2.37
 lxml==5.1.0
 html5lib
 beautifulsoup4
